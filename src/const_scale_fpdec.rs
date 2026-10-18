@@ -1,4 +1,4 @@
-use crate::fpdec_inner::FpdecInner;
+use crate::fpdec_inner::{div_ext_mixed, mul_ext_mixed, FpdecInner};
 use crate::oob_scale_fpdec::OobScaleFpdec;
 use crate::{IntoRatioInt, ParseError, Rounding};
 
@@ -6,7 +6,13 @@ use core::{fmt, num::ParseIntError, ops, str::FromStr};
 
 #[allow(unused_imports)]
 use num_traits::float::FloatCore; // used only for `no_std`
-use num_traits::{cast::FromPrimitive, Num, Signed};
+use num_traits::{cast::FromPrimitive, Num, PrimInt, Signed};
+
+/// A scale difference computed in `i64`: the sum of three `i32` scales can overflow `i32`, and
+/// a difference that large is out of range for every inner type anyway.
+fn scale_diff(d: i64) -> Option<i32> {
+    i32::try_from(d).ok()
+}
 
 /// Const-scale fixed-point decimal.
 ///
@@ -20,8 +26,27 @@ use num_traits::{cast::FromPrimitive, Num, Signed};
 /// For example, `ConstScaleFpdec<i64, 4>` means using `i64` as the underlying
 /// integer, and having `4` fraction precision.
 ///
+/// # Overflow
+///
+/// The operators (`+`, `-`, unary `-`, `abs`, `Sum`, ...) behave like the primitive integers:
+/// they panic on overflow when overflow checks are enabled (debug builds) and wrap around
+/// when they are not (release builds). Use the `checked_*` methods wherever an overflow is
+/// possible; they return `None` in every profile.
+///
 /// See [the module-level documentation](super) for more information.
 #[derive(Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Default)]
+// `FromBytes` is sound here (unlike range-restricted decimal types): this is
+// `repr(transparent)` over `I` and carries NO invariant -- `FpdecInner::MAX` is
+// `I::MAX` -- so every bit pattern of `I` denotes a valid decimal.
+#[cfg_attr(
+    feature = "zerocopy",
+    derive(
+        zerocopy::IntoBytes,
+        zerocopy::FromBytes,
+        zerocopy::Immutable,
+        zerocopy::KnownLayout
+    )
+)]
 #[repr(transparent)]
 pub struct ConstScaleFpdec<I, const S: i32>(I);
 
@@ -89,8 +114,7 @@ where
     where
         J: FpdecInner,
     {
-        self.0
-            .checked_mul_ext(I::from(rhs.0)?, S + S2 - SR, rounding)
+        mul_ext_mixed(self.0, rhs.0, scale_diff(S as i64 + S2 as i64 - SR as i64)?, rounding)
             .map(ConstScaleFpdec)
     }
 
@@ -144,17 +168,27 @@ where
     where
         J: FpdecInner,
     {
-        self.0
-            .checked_div_ext(I::from(rhs.0)?, S - S2 - SR, rounding)
+        div_ext_mixed(self.0, rhs.0, scale_diff(S as i64 - S2 as i64 - SR as i64)?, rounding)
             .map(ConstScaleFpdec)
     }
 
     /// Round the decimal at the specified scale.
     ///
     /// Equivalent to [`Self::round_ext`] with `Rounding::Round`.
+    ///
+    /// # Panics
+    ///
+    /// If the rounded value is not representable, e.g. rounding `127` of an
+    /// `i8` UP to hundreds. See [`Self::checked_round`] for a non-panicking form.
     #[must_use]
     pub fn round(self, scale: i32) -> Self {
         self.round_ext(scale, Rounding::Round)
+    }
+
+    /// Checked [`Self::round`]: `None` if the rounded value is not representable.
+    #[must_use]
+    pub fn checked_round(self, scale: i32) -> Option<Self> {
+        self.checked_round_ext(scale, Rounding::Round)
     }
 
     /// Round the decimal at the specified scale with rounding type.
@@ -173,9 +207,38 @@ where
     ///
     /// assert_eq!(price.round_ext(6, Rounding::Floor), fpdec!(12.123456));
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the rounded value is not representable, e.g. rounding `127` of an
+    /// `i8` UP to hundreds. See [`Self::checked_round_ext`] for a non-panicking form.
     #[must_use]
     pub fn round_ext(self, scale: i32, rounding: Rounding) -> Self {
-        Self(self.0.round_diff_with_rounding(S - scale, rounding))
+        self.checked_round_ext(scale, rounding)
+            .expect("overflow in decimal rounding")
+    }
+
+    /// Checked [`Self::round_ext`]: `None` if the rounded value is not
+    /// representable in `I`, instead of panicking.
+    ///
+    /// Rounding away from the original value can leave the type's range: `i8`
+    /// `127` rounded up to hundreds is `200`; and at a scale beyond `I::DIGITS`
+    /// any non-zero value that rounds away from zero becomes `+-10^n`.
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec, Rounding};
+    /// type Dec = ConstScaleFpdec<i8, 0>;
+    ///
+    /// assert_eq!(Dec::from_mantissa(127).checked_round_ext(-2, Rounding::Ceiling), None);
+    /// assert_eq!(Dec::from_mantissa(127).checked_round_ext(-2, Rounding::Floor),
+    ///     Some(Dec::from_mantissa(100)));
+    /// ```
+    #[must_use]
+    pub fn checked_round_ext(self, scale: i32, rounding: Rounding) -> Option<Self> {
+        // saturating: `S - scale` must not overflow for an absurd `scale`.
+        self.0
+            .checked_round_diff_with_rounding(S.saturating_sub(scale), rounding)
+            .map(Self)
     }
 }
 
@@ -328,7 +391,7 @@ convert_from_int!(u64);
 convert_from_int!(u128);
 
 macro_rules! convert_from_float {
-    ($float_type:ty, $from_fn:ident, $to_fn:ident) => {
+    ($float_type:ty, $from_fn:ident, $to_fn:ident, $scale:path) => {
         impl<I, const S: i32> TryFrom<$float_type> for ConstScaleFpdec<I, S>
         where
             I: FromPrimitive + FpdecInner,
@@ -341,6 +404,8 @@ macro_rules! convert_from_float {
             /// exactly, so this method always rounds the float number into
             /// ConstScaleFpdec.
             ///
+            /// NaN and infinities are `ParseError::Overflow`.
+            ///
             /// Examples:
             ///
             /// ```
@@ -352,13 +417,7 @@ macro_rules! convert_from_float {
             /// assert_eq!(Decimal::try_from(1.23456789).unwrap(), Decimal::from_str("1.2346").unwrap());
             /// ```
             fn try_from(f: $float_type) -> Result<Self, Self::Error> {
-                let inner_f = if S > 0 {
-                    f * 10.0.powi(S)
-                } else if S < 0 {
-                    f / 10.0.powi(-S)
-                } else {
-                    f
-                };
+                let inner_f = $scale(f, S.unsigned_abs(), S < 0);
                 I::$from_fn(inner_f.round())
                     .map(Self)
                     .ok_or(ParseError::Overflow)
@@ -389,20 +448,14 @@ macro_rules! convert_from_float {
             /// ```
             fn from(dec: ConstScaleFpdec<I, S>) -> Self {
                 let f = dec.0.$to_fn().unwrap();
-                if S > 0 {
-                    f / 10.0.powi(S)
-                } else if S < 0 {
-                    f * 10.0.powi(-S)
-                } else {
-                    f
-                }
+                $scale(f, S.unsigned_abs(), S > 0)
             }
         }
     };
 }
 
-convert_from_float!(f32, from_f32, to_f32);
-convert_from_float!(f64, from_f64, to_f64);
+convert_from_float!(f32, from_f32, to_f32, crate::scale_f32);
+convert_from_float!(f64, from_f64, to_f64, crate::scale_f64);
 
 impl<I, const S: i32> ops::Neg for ConstScaleFpdec<I, S>
 where
@@ -411,6 +464,45 @@ where
     type Output = Self;
     fn neg(self) -> Self::Output {
         Self(-self.0)
+    }
+}
+
+/// Checked remainder, and the `%` operator.
+///
+/// Both operands share a scale, so the remainder is just the remainder of the
+/// mantissas -- exact, and needing no rescale.
+impl<I, const S: i32> ConstScaleFpdec<I, S>
+where
+    I: FpdecInner,
+{
+    /// Checked remainder. Returns `None` if `rhs` is zero. `MIN % -1` is `0`, not an overflow.
+    #[must_use]
+    pub fn checked_rem(self, rhs: Self) -> Option<Self> {
+        if rhs.0 == I::ZERO {
+            None
+        } else if I::MIN < I::ZERO && rhs.0 == I::ZERO - I::ONE {
+            // `x % -1` is 0 for every `x`, but the hardware instruction overflows
+            // (and Rust panics) for `MIN % -1`.
+            Some(Self(I::ZERO))
+        } else {
+            Some(Self(self.0 % rhs.0))
+        }
+    }
+}
+
+/// Performs the `%` operation.
+///
+/// # Panics
+///
+/// If `rhs` is zero.
+impl<I, const S: i32> ops::Rem for ConstScaleFpdec<I, S>
+where
+    I: FpdecInner,
+{
+    type Output = Self;
+    fn rem(self, rhs: Self) -> Self::Output {
+        self.checked_rem(rhs)
+            .expect("attempt to calculate the remainder with a divisor of zero")
     }
 }
 
@@ -476,7 +568,11 @@ where
 impl<I, J, const S: i32> ops::Mul<J> for ConstScaleFpdec<I, S>
 where
     I: FpdecInner,
-    J: Into<I> + Num, // the `Num` to avoid conflicting implementations only
+    J: Into<I> + PrimInt, // `PrimInt` keeps this disjoint from the decimal-by-decimal
+    // impl above. It used to be `Num`, which worked only by coincidence: nothing
+    // implemented `Num` for a decimal. `num-traits-impls` does, so the marker has
+    // to be one a decimal will never satisfy. (`PrimInt` is already this crate's
+    // marker for "primitive integer" -- see `IntoRatioInt`.)
 {
     type Output = Self;
     fn mul(self, rhs: J) -> Self::Output {
@@ -526,7 +622,7 @@ where
 impl<I, J, const S: i32> ops::Div<J> for ConstScaleFpdec<I, S>
 where
     I: FpdecInner,
-    J: Into<I> + Num,
+    J: Into<I> + PrimInt,
 {
     type Output = Self;
     fn div(self, rhs: J) -> Self::Output {
@@ -566,7 +662,7 @@ where
 impl<I, J, const S: i32> ops::MulAssign<J> for ConstScaleFpdec<I, S>
 where
     I: FpdecInner,
-    J: Into<I> + Num,
+    J: Into<I> + PrimInt,
 {
     fn mul_assign(&mut self, rhs: J) {
         *self = *self * rhs;
@@ -587,7 +683,7 @@ where
 impl<I, J, const S: i32> ops::DivAssign<J> for ConstScaleFpdec<I, S>
 where
     I: FpdecInner,
-    J: Into<I> + Num,
+    J: Into<I> + PrimInt,
 {
     fn div_assign(&mut self, rhs: J) {
         *self = *self / rhs;
@@ -627,17 +723,24 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "serde")]
 impl<I, const S0: i32> Serialize for ConstScaleFpdec<I, S0>
 where
-    I: FpdecInner + fmt::Display,
+    I: FpdecInner + fmt::Display + Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // XXX how to selete dump type?
         if serializer.is_human_readable() {
+            // Decimal string: exact, and readable by anything.
             serializer.collect_str(self)
         } else {
-            Into::<f64>::into(*self).serialize(serializer)
+            // The raw mantissa: exact, compact, and the scale is carried by the
+            // TYPE, so the round-trip needs nothing else.
+            //
+            // This deliberately does NOT go through `f64`. `f64` holds ~15.9
+            // significant decimal digits; `ConstScaleFpdec<i128, 12>` holds up
+            // to 39. Serializing money through `f64` silently truncates it --
+            // e.g. 123456789.123456789012 comes back as 123456789.12345679.
+            self.0.serialize(serializer)
         }
     }
 }
@@ -645,7 +748,7 @@ where
 #[cfg(feature = "serde")]
 impl<'de, I, const S: i32> Deserialize<'de> for ConstScaleFpdec<I, S>
 where
-    I: FromPrimitive + FpdecInner + Num<FromStrRadixErr = ParseIntError>,
+    I: FromPrimitive + FpdecInner + Num<FromStrRadixErr = ParseIntError> + Deserialize<'de>,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -660,7 +763,8 @@ where
         macro_rules! visit_num {
             ($func_name:ident, $num_type:ty) => {
                 fn $func_name<E: de::Error>(self, n: $num_type) -> Result<Self::Value, E> {
-                    ConstScaleFpdec::try_from(n).map_err(|_| E::custom("decimal overflow"))
+                    // the error says which it was: overflow, or precision lost (scale < 0)
+                    ConstScaleFpdec::try_from(n).map_err(E::custom)
                 }
             };
         }
@@ -693,14 +797,22 @@ where
             visit_num!(visit_u128, u128);
         }
 
-        deserializer.deserialize_any(ConstScaleFpdecVistor(PhantomData))
+        // `deserialize_any` requires a SELF-DESCRIBING format. Asking bincode
+        // (and friends) for it fails outright with `DeserializeAnyNotSupported`,
+        // which is why the binary path used to be unusable in both directions.
+        // Human-readable formats keep the permissive any-visitor; binary formats
+        // read back exactly what `serialize` wrote: the mantissa.
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(ConstScaleFpdecVistor(PhantomData))
+        } else {
+            I::deserialize(deserializer).map(ConstScaleFpdec)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate as primitive_fixed_point_decimal;
     use crate::fpdec;
 
     #[test]
