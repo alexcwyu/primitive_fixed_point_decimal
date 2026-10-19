@@ -1,5 +1,111 @@
 # Unreleased
 
+- Docs: clarify overflow-check-dependent `Neg` behavior and the separate `i64`/`u64` limits of default `FromPrimitive` forwarding.
+
+- Fix: converting a large `u128` decimal to `f32` no longer overflows the mantissa before applying a positive scale; finite scaled values and underflow-to-zero results are preserved.
+
+- Docs: using decimal `*`/`/` operators instead of checked methods also requires a supported scale difference, not just a fitting result and non-zero divisor; doctests show that exact zero results still panic for unsupported scales.
+
+- Tests: const-scale multiplication/division reject scale differences of `+-2^32` rather than wrapping them back to zero; replacing checked narrowing of the three-scale difference with an `as i32` cast previously survived the complete release suite.
+
+- Fix: float scaling uses plain IEEE exponentiation rather than the profile-dependent `powi` intrinsic, so huge-scale conversions now have identical debug and release mantissas (including subnormal `f64` input at scale 320).
+
+- Tests: large-scale float conversions exercise successful chunked scaling near rounding boundaries; changing the `f32`/`f64` chunk sizes by one changes representable mantissas and previously survived the release suite. Fixtures are checked against exact binary-rational values for both signs and both decimal wrappers.
+
+- Tests: `u128` `calc_mul_div` / `checked_mul_ratio_ext` where the first normalised dividend of the double-word reduction equals the divisor exactly (the divisor is the top 128 bits of `|a * b|`, e.g. `(2^90 - 1) * (2^90 + 1) / (2^128 - 1) = 2^52`); the mutant `dividend <= divisor` in `reduce2_big` returned `2^51` there and passed the whole `cargo test --release` suite, even at `PFPD_ORACLE_SCALE=40`.
+
+- Tests: `i128` `calc_mul_div` / `checked_mul_ratio_ext` with `c = +-1` and an exact quotient of `-(2^127 + 1)` (one beyond `MIN`, reached through the final-division branch where the partial quotient is odd) must be `None`; the mutant `q > i128::MAX as u128 + 2` returned `Some(i128::MAX)` and passed the whole `cargo test --release` suite.
+
+- Tests: `TryFrom<integer>` / `fpdec!(int)` is checked against a BigInt specification for all ten source and all ten inner types at scales around 0 and 1 (const and out-of-band), because `S > 0` mutated to `S > 1` (which turns `ConstScaleFpdec<i32, 1>::try_from(100_i8)` into `Overflow`) passed the whole suite.
+
+- Docs: the `None` conditions of the arithmetic methods were listed incompletely. `checked_mul_ratio[_ext]` also return `None` for a zero `b`, and `OobScaleFpdec::checked_mul_const_scale[_ext]` / `checked_div_const_scale[_ext]` also return `None` when the scale `S` of `rhs` is outside `[-DIGITS, DIGITS]` (even for a zero operand); doctests demonstrate each case. `Signed::signum` (and `One::one`) panic for a non-zero value when `1` is not representable at the scale, and `FpdecInner::as_wider` / `from_wider` panic for `i128` / `u128`: documented, with `should_panic` doctests.
+
+- Docs: distinguish exact integer `FromPrimitive` conversions from rounded floating-point conversions; doctests cover positive/negative ties, infinity, and coarse-scale integers.
+
+- Docs: correct the `MAX`/`MIN` mantissa limits used by arithmetic and saturation: for a `b`-bit inner type, signed `MAX` is `2^(b - 1) - 1`, signed `MIN` is `-2^(b - 1)`, and unsigned `MIN` is zero. Doctests verify the formulas for both wrappers.
+
+- **Faster decimal division without LTO:** inline the scale/mixed-type dispatchers so constant scales and rounding reach the integer division; i32 division (including random signs) now matches the widened-i64 reference, and i64/u64 division benefits too. Signed/full-width i32 performance regressions are checked by the arithmetic benchmark tool.
+
+- Tests: every method without `_ext` (`checked_mul`, `checked_div`, `checked_rescale`, `round`, `round_diff`, `checked_round_to_multiple`, `checked_mul_ratio`, `checked_div_int`, `*`, `/`, `*=`, `/=`, ...) is checked to round with `Rounding::Round`, for both wrappers; replacing the default mode of any of 26 forwarding calls by `Floor`/`Ceiling`/`TowardsZero`/`AwayFromZero` previously passed the whole suite.
+
+- Tests: 128-bit `calc_mul_div` / `checked_mul_ratio_ext` when `a * b` overflows -- the sign of the quotient when `a ^ b ^ c == 0`, quotients on and just beyond `MIN`/`MAX`, and a product whose high word reaches the divisor (`mhigh >= c` in `reduce2_big`); mutants of those checks, such as `(self ^ b ^ c) <= 0` and deleting the `return None`, previously survived.
+
+- Tests: a mixed-width result of exactly `MIN + 1` (`-5 * (2 * MAX) / 10` against a `u128` right-hand side) survives the magnitude-to-sign conversion (`m <= i128::MAX as u128` mutated to `<` survived).
+
+- Tests: the `num-traits` `Zero::is_zero` trait method is exercised (`x.is_zero()` resolves to the inherent method, so the trait impl was never called and `==` mutated to `!=` survived).
+
+- Comment correction: `i64`, as well as `u16`, can round to one unit when dropping more digits than its representable power-of-ten range.
+
+- **Faster scale increases:** only special-case zero when the power of ten is out of range; ordinary rescaling can use checked multiplication directly, without an extra branch.
+
+- **Faster `i32` decimal multiplication:** round the exact `i64` product via its magnitude and a rounding extra before dividing, avoiding signed quotient/remainder work (about 2.7x for a scale difference of 4).
+
+- Tests: exercise arithmetic operators, integer/decimal assignments, and owned/reference `Sum` for both wrappers and all ten inner types; an `OobScaleFpdec` `/=`-as-`*=` mutant previously survived.
+
+- Tests: cover negative const target scales and full-width `i32::MIN`/`MAX` rescale differences for every inner type and rounding mode; the missing negative-target branch allowed an arithmetic mutant to survive.
+
+- Tests: guard exact signed `MIN` results from an unsigned mixed-type RHS, including the `u128` magnitude `2^127` conversion branch that survived arithmetic mutation testing.
+
+- Docs: `OobScaleFpdec::checked_mul_ext` drops digits (and can round) for positive, not negative, scale differences; a doctest now demonstrates both signs.
+
+- **Faster `i128` rescaling without LTO:** keep the 64-bit division fast path inline so constant divisors fold through the rescale wrappers (about 3.5x for two dropped digits).
+
+- **Fix: direct `FpdecInner::calc_mul_div_exp` calls with exponent zero** now return the checked product for 64/128-bit types, instead of invoking division routines with invalid unsafe preconditions (debug panic / wrong release result).
+
+- **Faster string parsing (~1.7-2x for typical prices).** `FromStr` and
+  `try_from_str` first try a single pass over the bytes for the common shape
+  `[+-]digits[.digits]`; everything else, and every error, goes to the previous
+  implementation unchanged, so error kinds are identical. A test compares the
+  two paths on every string over a small alphabet and at the digit limits.
+
+- **Faster `i64`/`u64` division, `mul_ratio` and `checked_div_ext` with a negative
+  scale difference (~2.5x for `i64` `P / P`).** They went through a signed
+  `i128` division, which is two library calls plus sign fix-ups; they are now
+  one `u128 / u64` on the magnitudes.
+
+- **Faster `u64`/`u128` multiplication and 128-bit integer division without LTO
+  (~1.2-1.5x).** `calc_mul_div_exp` of `u64`/`u128` and `rounding_div` of
+  `i128`/`u128` lacked `#[inline]`, so a downstream crate built without LTO paid
+  a call for each and could not fold the constant scale.
+
+- **Faster `Display` for 128-bit types (~2x).** The digits are cut into 19-digit
+  chunks with one division by a power of ten instead of one `u128` division per
+  digit pair, and trailing fraction zeros are dropped by looking at the bytes
+  rather than dividing by ten once per zero.
+
+- **Fix: `Display` with a scale of `i32::MIN` panicked with an index error**
+  (`scale.abs()` overflows; in release builds it wrapped negative and passed the
+  "scale <= 200" check). It reports the documented limit now.
+
+- **Add `from_ascii` / `try_from_ascii`**: parse `&[u8]` directly (market data
+  arrives as bytes). Non-UTF-8 input is `ParseError::Invalid`.
+
+- **Add `format_into`**: format into a caller's `&mut [u8]` and get the `&str`
+  back, without `core::fmt` (~1.5x faster than `Display` for `i64`) and without
+  allocating. Same text as `Display` (`{}` / `{:.N}`); `None` if the buffer is
+  too short, or where `Display` would panic (scale or precision beyond 200).
+
+- **Add `checked_rescale` / `checked_rescale_ext`** (`ConstScaleFpdec`: target
+  scale as a const generic; `OobScaleFpdec`: `diff_scale`): the same number at
+  another scale, with the rounding of your choice for the dropped digits.
+
+- **Add `checked_round_to_multiple` / `checked_round_to_multiple_ext`**: round to
+  a multiple of a step, e.g. a price to the tick size. The step's sign does not
+  matter, including `MIN`.
+
+- **Add `saturating_add`, `saturating_sub`** and, for signed types,
+  **`checked_neg`** (`Neg` panics on `MIN` when overflow checks are enabled, and wraps to `MIN` otherwise).
+
+- **Tests: the in-crate unit tests of `calc_mul_div`/`calc_mul_div_exp`, number
+  formatting and `rounding_div` are removed.** They compared two implementations
+  by the same author on shared operands, or hand-picked tables, and are strictly
+  weaker than `tests/oracle.rs` and `tests/parse_format.rs` (arbitrary-precision
+  oracle, all ten types); mutating the code under them is caught by the oracle
+  alone. The oracle gained targeted inputs it was missing -- results that land
+  exactly on `MIN`/`MAX` and `a * n / n` -- which kill two mutants of the 128-bit
+  overflow checks that the old tests also missed. `cargo test` of the library
+  itself went from ~36 s to instant.
+
 - **Add `num-traits-impls` feature**: `Zero`, `One`, `Num`, `Bounded`, `Signed`,
   `CheckedAdd`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`, `ToPrimitive`, `FromPrimitive`.
   `NumCast`/`PrimInt` are deliberately not implemented -- a decimal is not an
@@ -101,7 +207,8 @@
   -- `ConstScaleFpdec<i8, -3>` of value 1000 (it multiplied in the inner type), and
   anything below 1 when `10^S` does not fit (`u16` at scale 5). The integer methods now
   compute in `i128`/`u128`. `FromPrimitive::from_i128`/`from_u128` went through
-  `i64`/`u64` and rejected every value above 2^63 even for 128-bit types.
+  `i64`/`u64` and rejected inputs outside those source widths, even when a
+  128-bit decimal could represent them.
 
 - **Fix: serde reported "decimal overflow" for every failed integer/float input**,
   including precision loss at a negative scale; it now reports the actual `ParseError`.

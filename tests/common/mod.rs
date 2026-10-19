@@ -284,6 +284,32 @@ pub fn tie_pairs<T: Int>(rng: &mut Rng, per_i: usize) -> Vec<(T, T)> {
     out
 }
 
+/// Pairs `(10^i, r)` and `(r, 10^i)` for results `r` ON and next to the type's limits.
+///
+/// `a * b / 10^i` (and `a * 10^i / b`, with the pair read the other way round) is then `r`
+/// EXACTLY, so these hit the one place random pairs almost never do: a quotient equal to
+/// `MIN` or `MAX` -- or one step beyond them -- where a `>` against the limit that should be
+/// a `>=` (or the other way round, or `MAX + 1` for a negative result only) shows up.
+pub fn exact_limit_pairs<T: Int>() -> Vec<(T, T)> {
+    let mut out = Vec::new();
+    let (lo, hi) = (T::min_big(), T::max_big());
+    for i in 0..=T::DIGITS {
+        let Some(p) = T::from_big(&pow10(i)) else { continue };
+        for r in [&lo, &hi] {
+            for d in -2..=2i32 {
+                if let Some(r) = T::from_big(&(r + d)) {
+                    out.push((p, r));
+                    out.push((r, p));
+                    if T::SIGNED {
+                        out.push((T::ZERO - p, r));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // The specification. Each function says what the DOCUMENTED contract returns.
 // ---------------------------------------------------------------------------

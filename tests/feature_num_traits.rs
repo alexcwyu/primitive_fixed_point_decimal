@@ -12,6 +12,9 @@ fn num_traits_surface_behaves() {
     assert_eq!(P::zero(), ConstScaleFpdec::from_mantissa(0));
     assert_eq!(P::one(), ConstScaleFpdec::from_mantissa(10_000)); // 1.0 at scale 4
     assert!(P::zero().is_zero());
+    // the TRAIT method (`x.is_zero()` above resolves to the inherent one)
+    assert!(Zero::is_zero(&P::zero()));
+    assert!(!Zero::is_zero(&P::one()));
 
     let a: P = "2.5".parse().unwrap();
     let b: P = "1.5".parse().unwrap();

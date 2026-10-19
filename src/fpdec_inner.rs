@@ -39,8 +39,26 @@ pub trait FpdecInner:
     fn get_exp(i: usize) -> Option<Self>;
 
     /// Used by as_wider() and from_wider(), which are invoked by calc_mul_div().
+    ///
+    /// `i128` and `u128` have no wider type: they implement `calc_mul_div()`
+    /// themselves and `as_wider()` / `from_wider()` panic for them.
     type Wider: FpdecInner;
+
+    /// Convert to [`Self::Wider`]. Panics for `i128` and `u128`.
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::FpdecInner;
+    /// assert_eq!((-3_i32).as_wider(), -3_i64);
+    /// ```
+    ///
+    /// ```should_panic
+    /// use primitive_fixed_point_decimal::FpdecInner;
+    /// let _ = 3_i128.as_wider(); // no wider type
+    /// ```
     fn as_wider(self) -> Self::Wider;
+
+    /// Convert from [`Self::Wider`], `None` if it does not fit. Panics for
+    /// `i128` and `u128`.
     fn from_wider(w: Self::Wider) -> Option<Self>;
 
     /// Calculate `self * b / c`.
@@ -53,7 +71,7 @@ pub trait FpdecInner:
     }
 
     /// Calculate `self * b / EXP[i]`.
-    /// i64, u64, i128, u128 have their own implemetations to avoid the
+    /// i32, i64, u64, i128, u128 have their own implemetations to avoid the
     /// expensive 128-bit division.
     fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
         self.calc_mul_div(b, Self::get_exp(i)?, rounding)
@@ -124,6 +142,8 @@ pub trait FpdecInner:
 
     // works only when: diff_scale in range [-Self::DIGITS, Self::DIGITS]
     // diff_scale = scale (self + rhs - result)
+    // Keep constant scales/rounding visible through the mixed-type dispatcher.
+    #[inline(always)]
     fn checked_div_ext(self, rhs: Self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
         if diff_scale > 0 {
             // self / rhs / diff_exp
@@ -168,6 +188,36 @@ pub trait FpdecInner:
         }
     }
 
+    // diff_scale = scale (src - dst): the same number at another scale. Rounds the digits
+    // dropped when `diff_scale > 0`; `None` if it does not fit when `diff_scale < 0`.
+    // Inline through the wrappers before optimising division: a constant scale
+    // must reach the i128 rounding_div fast path as a constant divisor.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn checked_rescale_diff(self, diff_scale: i64, rounding: Rounding) -> Option<Self> {
+        if diff_scale == 0 {
+            Some(self)
+        } else if diff_scale > 0 {
+            let i = usize::try_from(diff_scale).unwrap_or(usize::MAX);
+            match Self::get_exp(i) {
+                Some(exp) => self.rounding_div(exp, rounding),
+                // `|self| < 10^i`: the quotient is 0 or +-1
+                None => Some(if !self.rounds_to_unit_beyond_range(i, rounding) {
+                    Self::ZERO
+                } else if self < Self::ZERO {
+                    Self::ZERO - Self::ONE
+                } else {
+                    Self::ONE
+                }),
+            }
+        } else if diff_scale.unsigned_abs() > Self::DIGITS as u64 && self.is_zero() {
+            Some(self) // zero is zero at every scale, `10^-diff_scale` need not fit
+        } else {
+            let i = usize::try_from(diff_scale.unsigned_abs()).ok()?;
+            self.checked_mul(&Self::get_exp(i)?)
+        }
+    }
+
     /// For `|self| < 10^i` where `10^i` does NOT fit in `Self` (`i > DIGITS`):
     /// does `self / 10^i` round to a non-zero value (`+-1`)?
     fn rounds_to_unit_beyond_range(self, i: usize, rounding: Rounding) -> bool {
@@ -183,7 +233,7 @@ pub trait FpdecInner:
                 // `2 * |self| >= 10^i`. Since `Self::MAX < 10^(DIGITS+1)`, that can
                 // hold only for `i == DIGITS + 1`, where it reads
                 // `|self| >= 5 * 10^DIGITS` -- reachable for `u16` (65535 >= 50000)
-                // and impossible for the others. Divide instead of multiplying so
+                // and `i64` (MAX >= 5e18), and impossible for the others. Divide instead of multiplying so
                 // nothing can overflow.
                 let five = <Self::Unsigned as num_traits::NumCast>::from(5u8).unwrap();
                 i == Self::DIGITS as usize + 1
@@ -291,6 +341,116 @@ pub trait FpdecInner:
     where
         Self: Num<FromStrRadixErr = ParseIntError>,
     {
+        match Self::try_from_ascii_fast(s.as_bytes(), scale) {
+            Some(v) => Ok(v),
+            None => Self::try_from_str_exact(s, scale),
+        }
+    }
+
+    // Same as `try_from_str()` for bytes: market data arrives as `&[u8]`, and validating UTF-8
+    // first just to take the string back apart costs more than the parse. Bytes that are not
+    // UTF-8 are `Invalid`, as any non-digit is.
+    #[doc(hidden)]
+    fn try_from_ascii(b: &[u8], scale: i32) -> Result<Self, ParseError>
+    where
+        Self: Num<FromStrRadixErr = ParseIntError>,
+    {
+        match Self::try_from_ascii_fast(b, scale) {
+            Some(v) => Ok(v),
+            None => match core::str::from_utf8(b) {
+                Ok(s) => Self::try_from_str_exact(s, scale),
+                Err(_) => Err(ParseError::Invalid),
+            },
+        }
+    }
+
+    // INTERNAL
+    // The common case of `try_from_str()` in one pass over the bytes: `[+-]?digits('.'digits)?`
+    // with at most `Self::DIGITS` digits in all (so the accumulator cannot overflow) and a
+    // fraction no longer than `scale`. Everything else -- other spellings, long numbers, every
+    // error -- returns `None`, and `try_from_str_exact()` decides it. So the two can never
+    // disagree about an error, and the tests check that they agree on every value.
+    #[inline]
+    #[doc(hidden)]
+    fn try_from_ascii_fast(b: &[u8], scale: i32) -> Option<Self> {
+        let (neg, mut i) = match *b.first()? {
+            b'-' => (true, 1),
+            b'+' => (false, 1),
+            _ => (false, 0),
+        };
+        if neg && Self::MIN == Self::ZERO {
+            return None; // unsigned: "-0" is zero but "-1" is an error; let the exact path say
+        }
+
+        let max_digits = Self::DIGITS as usize;
+        let mut acc = Self::ZERO;
+        let mut n_digits = 0;
+
+        while let Some(&c) = b.get(i) {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                break;
+            }
+            if n_digits == max_digits {
+                return None;
+            }
+            acc = acc * Self::TEN + <Self as num_traits::NumCast>::from(d)?;
+            n_digits += 1;
+            i += 1;
+        }
+        if n_digits == 0 {
+            return None;
+        }
+
+        let mut n_frac = 0;
+        if i < b.len() {
+            if b[i] != b'.' {
+                return None;
+            }
+            i += 1;
+            while let Some(&c) = b.get(i) {
+                let d = c.wrapping_sub(b'0');
+                if d > 9 {
+                    return None;
+                }
+                if n_digits == max_digits {
+                    return None;
+                }
+                acc = acc * Self::TEN + <Self as num_traits::NumCast>::from(d)?;
+                n_digits += 1;
+                n_frac += 1;
+                i += 1;
+            }
+            if n_frac == 0 {
+                return None; // "1."
+            }
+        }
+
+        // `10^shift` for the missing fraction digits. A fraction longer than `scale` is a
+        // precision error, and an integer string at a negative scale needs its trailing
+        // zeros counted; both are left to the exact path.
+        let shift = scale as i64 - n_frac as i64;
+        if shift < 0 {
+            return None;
+        }
+
+        // Signed first, then scaled: `-MIN` is not representable but `MIN * 10^shift` is
+        // checked like any other product.
+        let v = if neg { Self::ZERO - acc } else { acc };
+        if shift == 0 {
+            Some(v)
+        } else {
+            v.checked_mul(&Self::get_exp(shift as usize)?)
+        }
+    }
+
+    // INTERNAL
+    // The complete implementation of `try_from_str()`, with its error kinds.
+    #[doc(hidden)]
+    fn try_from_str_exact(s: &str, scale: i32) -> Result<Self, ParseError>
+    where
+        Self: Num<FromStrRadixErr = ParseIntError>,
+    {
         let (num, raw_scale) = match Self::try_from_str_only(s) {
             Ok(parsed) => parsed,
             // The digits alone do not fit in `Self`, and `try_from_str_only` cannot
@@ -391,19 +551,58 @@ pub trait FpdecInner:
         // the padding zeros for specified precision and big scales.
         // We panic if the string is too long.
         let mut buf: [MaybeUninit<u8>; 250] = [MaybeUninit::uninit(); 250];
-        assert!(scale.abs() <= 200);
+        // `unsigned_abs`: `i32::MIN.abs()` overflows (and wraps negative in release builds,
+        // which would sail past this check).
+        assert!(scale.unsigned_abs() <= 200);
 
-        let offset = display_num(self.unsigned_abs(), scale, f.precision(), &mut buf);
+        let (start, end) = display_num(self.unsigned_abs(), scale, f.precision(), &mut buf);
 
-        // SAFETY: offset is updated along with buf
+        // SAFETY: `display_num` initialized every byte of `buf[start..end]`.
         let buf = unsafe {
-            core::slice::from_raw_parts(buf[offset..].as_ptr().cast(), buf.len() - offset)
+            core::slice::from_raw_parts(buf[start..end].as_ptr().cast(), end - start)
         };
 
         // SAFETY: all data is valid charactor
         let s = unsafe { str::from_utf8_unchecked(buf) };
 
         f.pad_integral(self >= Self::ZERO, "", s)
+    }
+
+    // Format like `display_fmt()` (the sign included, no width or fill) into `out`, without
+    // going through `core::fmt`, whose machinery is most of the time of formatting a number.
+    // `None` if the text does not fit `out`, or the scale or precision is beyond what the
+    // formatting supports (the limits that make `display_fmt()` panic).
+    #[doc(hidden)]
+    fn format_into(self, scale: i32, precision: Option<usize>, out: &mut [u8]) -> Option<&str> {
+        let too_long = match precision {
+            None => false,
+            Some(p) if scale > 0 => p > 200,
+            Some(p) => p != 0 && p > 200_usize.saturating_sub(scale.unsigned_abs() as usize),
+        };
+        if scale.unsigned_abs() > 200 || too_long {
+            return None;
+        }
+
+        let mut buf: [MaybeUninit<u8>; 250] = [MaybeUninit::uninit(); 250];
+        let (start, end) = display_num(self.unsigned_abs(), scale, precision, &mut buf);
+
+        let is_neg = self < Self::ZERO;
+        let len = end - start + is_neg as usize;
+        let out = out.get_mut(..len)?;
+        if is_neg {
+            out[0] = b'-';
+        }
+        // SAFETY: `display_num` initialized every byte of `buf[start..end]`, and the
+        // destination `out[is_neg..]` is exactly `end - start` bytes long.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr().add(start).cast::<u8>(),
+                out.as_mut_ptr().add(is_neg as usize),
+                end - start,
+            );
+        }
+        // SAFETY: ASCII digits, '.' and '-' only.
+        Some(unsafe { str::from_utf8_unchecked(out) })
     }
 
     fn checked_from_int(self, scale: i32) -> Result<Self, ParseError> {
@@ -430,23 +629,30 @@ pub trait FpdecInner:
     }
 }
 
-// We assume the number is non-negative here. The caller should handle the sign.
+// Render the non-negative `uns` at `scale` into `buf`, which is filled from the right.
+// The caller should handle the sign.
+//
+// Returns the range `(start, end)` of the rendered text; `end` is `buf.len()` except when
+// trailing fraction zeros were dropped.
 fn display_num<I>(
     uns: I,
     scale: i32,
     precision: Option<usize>,
     buf: &mut [MaybeUninit<u8>],
-) -> usize
+) -> (usize, usize)
 where
-    I: FpdecInner + AsPrimitive<u8> + AsPrimitive<usize>,
+    I: FpdecInner,
 {
+    let end = buf.len();
+
     if scale <= 0 {
         let mut offset = buf.len();
 
         // padding 0 for precision
         let precision = precision.unwrap_or(0);
         if precision != 0 {
-            assert!(precision + (-scale) as usize <= 200);
+            // (a sum could wrap for a huge precision)
+            assert!(precision <= 200_usize.saturating_sub(scale.unsigned_abs() as usize));
 
             offset = pad_zeros(precision, buf);
 
@@ -457,10 +663,10 @@ where
 
         // padding 0 for negative scale
         if scale < 0 && !uns.is_zero() {
-            offset = pad_zeros((-scale) as usize, &mut buf[..offset]);
+            offset = pad_zeros(scale.unsigned_abs() as usize, &mut buf[..offset]);
         }
 
-        return dump_single(uns, &mut buf[..offset]);
+        return (dump_single(uns, &mut buf[..offset]), end);
     }
 
     // now, scale > 0
@@ -476,46 +682,47 @@ where
         // no precition set, remove fraction tailing zeros
         None => {
             if frac.is_zero() {
-                return dump_single(int, buf);
+                return (dump_single(int, buf), end);
             }
 
-            // remove fraction tailing zeros
-            let (frac, zeros) = {
-                let mut zeros = 0;
-                let mut n = frac;
-                while (n % I::TEN).is_zero() {
-                    n = n / I::TEN;
-                    zeros += 1;
-                }
-                (n, zeros)
-            };
-
-            dump_decimal(int, frac, scale - zeros, buf)
+            // Render all `scale` fraction digits, then drop the trailing zeros. Looking at the
+            // bytes is far cheaper than dividing the number by ten once per zero, and `frac`
+            // is not zero, so a non-zero digit stops the loop before the point.
+            let start = dump_decimal(int, frac, scale, buf);
+            let mut end = end;
+            // SAFETY: the bytes of `buf[start..]` were written by `dump_decimal`.
+            while unsafe { buf[end - 1].assume_init() } == b'0' {
+                end -= 1;
+            }
+            (start, end)
         }
 
         // set precision = 0, do not show the '.' char
-        Some(0) => match exp {
-            Some(exp) => {
-                if frac.saturating_add(frac) >= exp {
-                    dump_single(int + I::ONE, buf)
-                } else {
-                    dump_single(int, buf)
+        Some(0) => (
+            match exp {
+                Some(exp) => {
+                    if frac.saturating_add(frac) >= exp {
+                        dump_single(int + I::ONE, buf)
+                    } else {
+                        dump_single(int, buf)
+                    }
                 }
-            }
-            // `10^scale` does not fit in `I`, so the value is below 1 -- but not
-            // necessarily below 0.5 (`u16` 65535 at scale 5 is 0.65535).
-            None => {
-                let rounded = if frac.rounds_to_unit_beyond_range(scale, Rounding::Round) {
-                    I::ONE
-                } else {
-                    I::ZERO
-                };
-                dump_single(rounded, buf)
-            }
-        },
+                // `10^scale` does not fit in `I`, so the value is below 1 -- but not
+                // necessarily below 0.5 (`u16` 65535 at scale 5 is 0.65535).
+                None => {
+                    let rounded = if frac.rounds_to_unit_beyond_range(scale, Rounding::Round) {
+                        I::ONE
+                    } else {
+                        I::ZERO
+                    };
+                    dump_single(rounded, buf)
+                }
+            },
+            end,
+        ),
 
         // set precision > 0
-        Some(precision) => {
+        Some(precision) => (
             if precision == scale {
                 dump_decimal(int, frac, scale, buf)
             } else if precision > scale {
@@ -532,7 +739,7 @@ where
                             // for example: 12.99967 with precision=3, the fraction 99967
                             // is round to 1000 whose digits is more than 3.
                             if frac == prec_exp {
-                                return dump_decimal(int + I::ONE, I::ZERO, precision, buf);
+                                return (dump_decimal(int + I::ONE, I::ZERO, precision, buf), end);
                             }
                         }
 
@@ -549,15 +756,16 @@ where
                     }
                 };
                 dump_decimal(int, frac, precision, buf)
-            }
-        }
+            },
+            end,
+        ),
     }
 }
 
 // dump: "int . frac"
 fn dump_decimal<I>(int: I, frac: I, scale: usize, buf: &mut [MaybeUninit<u8>]) -> usize
 where
-    I: FpdecInner + AsPrimitive<u8> + AsPrimitive<usize>,
+    I: FpdecInner,
 {
     let mut offset = dump_single(frac, buf);
 
@@ -570,39 +778,77 @@ where
 }
 
 // dump a single integer number
-// This is much faster than using integers' Display.
 fn dump_single<I>(n: I, buf: &mut [MaybeUninit<u8>]) -> usize
 where
-    I: FpdecInner + AsPrimitive<u8> + AsPrimitive<usize>,
+    I: FpdecInner,
 {
-    static DECIMAL_PAIRS: &[u8; 200] = b"\
-        0001020304050607080910111213141516171819\
-        2021222324252627282930313233343536373839\
-        4041424344454647484950515253545556575859\
-        6061626364656667686970717273747576777879\
-        8081828384858687888990919293949596979899";
+    // `size_of` is a constant, so this is not a branch at run time.
+    if core::mem::size_of::<I>() <= 8 {
+        dump_u64(n.to_u64().unwrap_or(0), buf) // always `Some`: it fits
+    } else {
+        dump_u128(n.to_u128().unwrap_or(0), buf)
+    }
+}
 
+// Format per two digits from the lookup table. This is much faster than using integers' Display.
+static DECIMAL_PAIRS: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
+
+fn dump_u64(mut n: u64, buf: &mut [MaybeUninit<u8>]) -> usize {
     let mut offset = buf.len();
-    let mut remain = n;
 
-    // Format per two digits from the lookup table.
-    while remain >= I::TEN {
+    while n >= 100 {
         offset -= 2;
-
-        let pair: usize = (remain % I::HUNDRED).as_();
-        remain = remain / I::HUNDRED;
-        buf[offset + 0].write(DECIMAL_PAIRS[pair * 2 + 0]);
-        buf[offset + 1].write(DECIMAL_PAIRS[pair * 2 + 1]);
+        let pair = (n % 100) as usize * 2;
+        n /= 100;
+        buf[offset].write(DECIMAL_PAIRS[pair]);
+        buf[offset + 1].write(DECIMAL_PAIRS[pair + 1]);
     }
 
-    // Format the last remaining digit, if any.
-    if remain != I::ZERO || n == I::ZERO {
+    // the last one or two digits; `0` is written as "0"
+    if n >= 10 {
+        offset -= 2;
+        buf[offset].write(DECIMAL_PAIRS[n as usize * 2]);
+        buf[offset + 1].write(DECIMAL_PAIRS[n as usize * 2 + 1]);
+    } else {
         offset -= 1;
-        let remain: u8 = remain.as_();
-        buf[offset].write(b'0' + remain);
+        buf[offset].write(b'0' + n as u8);
     }
 
     offset
+}
+
+// A `u128` division is a slow library call per digit pair, so cut the number into chunks of
+// 19 digits (which fit in `u64`) with at most two divisions by a power of ten.
+fn dump_u128(n: u128, buf: &mut [MaybeUninit<u8>]) -> usize {
+    const E19: u128 = 10_u128.pow(19);
+
+    let Some(high) = div_pow10::bit128::div_single(n, 19) else {
+        unreachable!() // 19 <= 38
+    };
+    if high == 0 {
+        return dump_u64(n as u64, buf);
+    }
+    let low = (n - high * E19) as u64;
+
+    let mut offset = dump_u64(low, buf);
+    offset = pad_zeros(19 - (buf.len() - offset), &mut buf[..offset]);
+
+    // `high` is below 3.5e19, and `u64` goes up to 1.8e19
+    if let Ok(high) = u64::try_from(high) {
+        dump_u64(high, &mut buf[..offset])
+    } else {
+        let top = high / E19;
+        let mid = (high - top * E19) as u64;
+        let written_to = offset;
+        offset = dump_u64(mid, &mut buf[..written_to]);
+        offset = pad_zeros(19 - (written_to - offset), &mut buf[..offset]);
+        dump_u64(top as u64, &mut buf[..offset])
+    }
 }
 
 fn pad_zeros(n: usize, buf: &mut [MaybeUninit<u8>]) -> usize {
@@ -612,340 +858,6 @@ fn pad_zeros(n: usize, buf: &mut [MaybeUninit<u8>]) -> usize {
         buf[offset].write(b'0');
     }
     offset
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    extern crate std;
-    use std::fmt;
-
-    struct TestFmt<I> {
-        n: I,
-        scale: i32,
-    }
-    impl<I: FpdecInner + fmt::Display> fmt::Display for TestFmt<I> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-            self.n.display_fmt(self.scale, f)
-        }
-    }
-    fn do_test_format<I>(s: &str, scale: i32, n: I)
-    where
-        I: FpdecInner + fmt::Display + fmt::Debug + Num<FromStrRadixErr = ParseIntError>,
-    {
-        //println!("test: {s}, {scale}, {n}");
-        assert_eq!(I::try_from_str(s, scale), Ok(n));
-
-        //println!("test: {s} {scale} {n}");
-        let (n1, scale1) = I::try_from_str_only(s).unwrap();
-        let n2 = n1 * I::TEN.pow((scale - scale1) as u32);
-        assert_eq!(n2, n);
-
-        let ts = TestFmt { n, scale };
-        assert_eq!(std::format!("{}", &ts), s);
-    }
-
-    fn do_test_format_num_only<I>(n: I)
-    where
-        I: FpdecInner + fmt::Display + fmt::Debug + Num<FromStrRadixErr = ParseIntError>,
-    {
-        for scale in -100..100 {
-            let ts = TestFmt { n, scale };
-            let out = std::format!("{}", ts);
-
-            //println!("scale:{scale}, n:{n}, out:{out}");
-            assert_eq!(I::try_from_str(&out, scale), Ok(n));
-        }
-    }
-
-    #[test]
-    fn test_format() {
-        // empty
-        assert_eq!(i8::try_from_str("", 2), Err(ParseError::Empty));
-
-        // zero
-        assert_eq!(i8::try_from_str("0", 2), Ok(0));
-        assert_eq!(i8::try_from_str("0.0", 2), Ok(0));
-        assert_eq!(i8::try_from_str("-0", 2), Ok(0));
-        assert_eq!(i8::try_from_str("-0.0", 2), Ok(0));
-        assert_eq!(i8::try_from_str("+0", 2), Ok(0));
-        assert_eq!(i8::try_from_str("+0.0", 2), Ok(0));
-
-        // positive
-        do_test_format("12300", -2, 123_i8);
-        do_test_format("1230", -1, 123_i8);
-        do_test_format("123", 0, 123_i8);
-        do_test_format("12.3", 1, 123_i8);
-        do_test_format("1.23", 2, 123_i8);
-        do_test_format("0.123", 3, 123_i8);
-        do_test_format("0.0123", 4, 123_i8);
-        do_test_format("0.00123", 5, 123_i8);
-        do_test_format("0.000123", 6, 123_i8);
-
-        do_test_format("12000", -2, 120_i8);
-        do_test_format("1200", -1, 120_i8);
-        do_test_format("120", 0, 120_i8);
-        do_test_format("12", 1, 120_i8);
-        do_test_format("1.2", 2, 120_i8);
-        do_test_format("0.12", 3, 120_i8);
-        do_test_format("0.012", 4, 120_i8);
-        do_test_format("0.0012", 5, 120_i8);
-        do_test_format("0.00012", 6, 120_i8);
-
-        // negative with i8::MIN
-        do_test_format("-12800", -2, -128_i8);
-        do_test_format("-1280", -1, -128_i8);
-        do_test_format("-128", 0, -128_i8);
-        do_test_format("-12.8", 1, -128_i8);
-        do_test_format("-1.28", 2, -128_i8);
-        do_test_format("-0.128", 3, -128_i8);
-        do_test_format("-0.0128", 4, -128_i8);
-        do_test_format("-0.00128", 5, -128_i8);
-        do_test_format("-0.000128", 6, -128_i8);
-
-        // u8
-        // positive
-        do_test_format("12300", -2, 123_u8);
-        do_test_format("1230", -1, 123_u8);
-        do_test_format("123", 0, 123_u8);
-        do_test_format("12.3", 1, 123_u8);
-        do_test_format("1.23", 2, 123_u8);
-        do_test_format("0.123", 3, 123_u8);
-        do_test_format("0.0123", 4, 123_u8);
-        do_test_format("0.00123", 5, 123_u8);
-        do_test_format("0.000123", 6, 123_u8);
-
-        do_test_format("12000", -2, 120_u8);
-        do_test_format("1200", -1, 120_u8);
-        do_test_format("120", 0, 120_u8);
-        do_test_format("12", 1, 120_u8);
-        do_test_format("1.2", 2, 120_u8);
-        do_test_format("0.12", 3, 120_u8);
-        do_test_format("0.012", 4, 120_u8);
-        do_test_format("0.0012", 5, 120_u8);
-        do_test_format("0.00012", 6, 120_u8);
-
-        do_test_format("25500", -2, 255_u8);
-        do_test_format("2550", -1, 255_u8);
-        do_test_format("255", 0, 255_u8);
-        do_test_format("25.5", 1, 255_u8);
-        do_test_format("2.55", 2, 255_u8);
-        do_test_format("0.255", 3, 255_u8);
-        do_test_format("0.0255", 4, 255_u8);
-        do_test_format("0.00255", 5, 255_u8);
-        do_test_format("0.000255", 6, 255_u8);
-    }
-
-    #[test]
-    fn test_format_num_only() {
-        do_test_format_num_only(0);
-        do_test_format_num_only(1_u8);
-        do_test_format_num_only(12_u8);
-        do_test_format_num_only(123_u8);
-        do_test_format_num_only(255_u8);
-        do_test_format_num_only(1_i8);
-        do_test_format_num_only(12_i8);
-        do_test_format_num_only(123_i8);
-        do_test_format_num_only(-1_i8);
-        do_test_format_num_only(-12_i8);
-        do_test_format_num_only(-123_i8);
-        do_test_format_num_only(-128_i8);
-
-        do_test_format_num_only(1_i128);
-        do_test_format_num_only(12_i128);
-        do_test_format_num_only(123_i128);
-        do_test_format_num_only(-1_i128);
-        do_test_format_num_only(-12_i128);
-        do_test_format_num_only(-123_i128);
-
-        do_test_format_num_only(i32::MAX);
-        do_test_format_num_only(i32::MIN);
-        do_test_format_num_only(i64::MAX);
-        do_test_format_num_only(i64::MIN);
-        do_test_format_num_only(i128::MAX);
-        do_test_format_num_only(i128::MIN);
-        do_test_format_num_only(i32::MAX / 2);
-        do_test_format_num_only(i32::MIN / 2);
-        do_test_format_num_only(i64::MAX / 2);
-        do_test_format_num_only(i64::MIN / 2);
-        do_test_format_num_only(i128::MAX / 2);
-        do_test_format_num_only(i128::MIN / 2);
-
-        do_test_format_num_only(1_u128);
-        do_test_format_num_only(12_u128);
-        do_test_format_num_only(123_u128);
-
-        do_test_format_num_only(u32::MAX);
-        do_test_format_num_only(u64::MAX);
-        do_test_format_num_only(u128::MAX);
-        do_test_format_num_only(u32::MAX / 2);
-        do_test_format_num_only(u64::MAX / 2);
-        do_test_format_num_only(u128::MAX / 2);
-    }
-
-    #[test]
-    fn test_options() {
-        let d = TestFmt {
-            n: 12_3470,
-            scale: 4,
-        };
-        let d2 = TestFmt {
-            n: 12_5470,
-            scale: 4,
-        };
-        let n = TestFmt {
-            n: -12_3470,
-            scale: 4,
-        };
-        let z = TestFmt { n: 0, scale: 4 };
-
-        assert_eq!(std::format!("{}", &d), "12.347");
-        assert_eq!(std::format!("{}", &n), "-12.347");
-        assert_eq!(std::format!("{}", &z), "0");
-
-        // width, fill, alignment
-        assert_eq!(std::format!("{:x>10}", &d), "xxxx12.347");
-        assert_eq!(std::format!("{:0>10}", &d), "000012.347");
-        assert_eq!(std::format!("{:x>10}", &n), "xxx-12.347");
-        assert_eq!(std::format!("{:010}", &n), "-00012.347");
-
-        // precision
-        assert_eq!(std::format!("{:.0}", &d), "12");
-        assert_eq!(std::format!("{:.0}", &d2), "13");
-        assert_eq!(std::format!("{:.2}", &d), "12.35");
-        assert_eq!(std::format!("{:.4}", &d), "12.3470");
-        assert_eq!(std::format!("{:.6}", &d), "12.347000");
-        assert_eq!(std::format!("{:.0}", &n), "-12");
-        assert_eq!(std::format!("{:.2}", &n), "-12.35");
-        assert_eq!(std::format!("{:.4}", &n), "-12.3470");
-        assert_eq!(std::format!("{:.6}", &n), "-12.347000");
-        assert_eq!(std::format!("{:.0}", &z), "0");
-        assert_eq!(std::format!("{:.2}", &z), "0.00");
-        assert_eq!(std::format!("{:.4}", &z), "0.0000");
-        assert_eq!(std::format!("{:.6}", &z), "0.000000");
-
-        // sign
-        assert_eq!(std::format!("{:+}", &d), "+12.347");
-        assert_eq!(std::format!("{:+}", &n), "-12.347");
-        assert_eq!(std::format!("{:+}", &z), "+0");
-
-        // all
-        assert_eq!(std::format!("{:x>+10.2}", &d), "xxxx+12.35");
-        assert_eq!(std::format!("{:+010.2}", &d), "+000012.35");
-
-        // neg-scale
-        let d = TestFmt { n: 12, scale: -4 };
-        assert_eq!(std::format!("{}", &d), "120000");
-        assert_eq!(std::format!("{:.0}", &d), "120000");
-        assert_eq!(std::format!("{:.2}", &d), "120000.00");
-    }
-
-    fn do_test_rounding_div_no_rem(a: i32, b: i32) {
-        let q = a / b;
-        assert_eq!(a.rounding_div(b, Rounding::Floor).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::Ceiling).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::Round).unwrap(), q);
-
-        assert_eq!((-a).rounding_div(-b, Rounding::Floor).unwrap(), q);
-        assert_eq!((-a).rounding_div(-b, Rounding::Ceiling).unwrap(), q);
-        assert_eq!((-a).rounding_div(-b, Rounding::Round).unwrap(), q);
-
-        assert_eq!(a.rounding_div(-b, Rounding::Floor).unwrap(), -q);
-        assert_eq!(a.rounding_div(-b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!(a.rounding_div(-b, Rounding::Round).unwrap(), -q);
-
-        assert_eq!((-a).rounding_div(b, Rounding::Floor).unwrap(), -q);
-        assert_eq!((-a).rounding_div(b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!((-a).rounding_div(b, Rounding::Round).unwrap(), -q);
-    }
-
-    fn do_test_rounding_div_small(a: i32, b: i32) {
-        let q = a / b;
-        let one = if a ^ b > 0 { 1 } else { -1 };
-        assert_eq!(a.rounding_div(b, Rounding::TowardsZero).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::AwayFromZero).unwrap(), q + one);
-        assert_eq!(a.rounding_div(b, Rounding::Round).unwrap(), q);
-    }
-
-    fn do_test_rounding_div_small4(a: i32, b: i32) {
-        let q = a / b;
-        assert_eq!(a.rounding_div(b, Rounding::Floor).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::Ceiling).unwrap(), q + 1);
-        assert_eq!(a.rounding_div(b, Rounding::Round).unwrap(), q);
-
-        assert_eq!((-a).rounding_div(-b, Rounding::Floor).unwrap(), q);
-        assert_eq!((-a).rounding_div(-b, Rounding::Ceiling).unwrap(), q + 1);
-        assert_eq!((-a).rounding_div(-b, Rounding::Round).unwrap(), q);
-
-        assert_eq!(a.rounding_div(-b, Rounding::Floor).unwrap(), -q - 1);
-        assert_eq!(a.rounding_div(-b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!(a.rounding_div(-b, Rounding::Round).unwrap(), -q);
-
-        assert_eq!((-a).rounding_div(b, Rounding::Floor).unwrap(), -q - 1);
-        assert_eq!((-a).rounding_div(b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!((-a).rounding_div(b, Rounding::Round).unwrap(), -q);
-    }
-
-    fn do_test_rounding_div_big(a: i32, b: i32) {
-        let q = a / b;
-        let one = if a ^ b > 0 { 1 } else { -1 };
-        assert_eq!(a.rounding_div(b, Rounding::TowardsZero).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::AwayFromZero).unwrap(), q + one);
-        assert_eq!(a.rounding_div(b, Rounding::Round).unwrap(), q + one);
-    }
-
-    fn do_test_rounding_div_big4(a: i32, b: i32) {
-        let q = a / b;
-        assert_eq!(a.rounding_div(b, Rounding::Floor).unwrap(), q);
-        assert_eq!(a.rounding_div(b, Rounding::Ceiling).unwrap(), q + 1);
-        assert_eq!(a.rounding_div(b, Rounding::Round).unwrap(), q + 1);
-
-        assert_eq!((-a).rounding_div(-b, Rounding::Floor).unwrap(), q);
-        assert_eq!((-a).rounding_div(-b, Rounding::Ceiling).unwrap(), q + 1);
-        assert_eq!((-a).rounding_div(-b, Rounding::Round).unwrap(), q + 1);
-
-        assert_eq!(a.rounding_div(-b, Rounding::Floor).unwrap(), -q - 1);
-        assert_eq!(a.rounding_div(-b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!(a.rounding_div(-b, Rounding::Round).unwrap(), -q - 1);
-
-        assert_eq!((-a).rounding_div(b, Rounding::Floor).unwrap(), -q - 1);
-        assert_eq!((-a).rounding_div(b, Rounding::Ceiling).unwrap(), -q);
-        assert_eq!((-a).rounding_div(b, Rounding::Round).unwrap(), -q - 1);
-    }
-
-    #[test]
-    fn test_rounding_div() {
-        do_test_rounding_div_no_rem(10, 5);
-        do_test_rounding_div_no_rem(10, 2);
-        do_test_rounding_div_no_rem(144, 12);
-
-        do_test_rounding_div_small4(7, 3);
-        do_test_rounding_div_small4(21, 5);
-        do_test_rounding_div_small4(22, 5);
-        do_test_rounding_div_small4(i32::MAX, i32::MAX - 1);
-
-        do_test_rounding_div_big4(8, 3);
-        do_test_rounding_div_big4(23, 5);
-        do_test_rounding_div_big4(24, 5);
-        do_test_rounding_div_big4(i32::MAX, 37);
-
-        do_test_rounding_div_small(i32::MIN, 20);
-        do_test_rounding_div_small(i32::MIN, -20);
-        do_test_rounding_div_small(100, i32::MIN);
-        do_test_rounding_div_small(-100, i32::MIN);
-
-        do_test_rounding_div_big(i32::MIN, 37);
-        do_test_rounding_div_big(i32::MIN, -37);
-        do_test_rounding_div_big(i32::MIN + 100, i32::MIN);
-        do_test_rounding_div_big(i32::MAX, i32::MIN);
-
-        assert_eq!(23_u32.rounding_div(5_u32, Rounding::Round).unwrap(), 5_u32);
-        assert_eq!(21_u32.rounding_div(5_u32, Rounding::Round).unwrap(), 4_u32);
-        assert_eq!(101_u32.rounding_div(100_u32, Rounding::Round).unwrap(), 1);
-        assert_eq!(199_u32.rounding_div(100_u32, Rounding::Round).unwrap(), 2);
-        assert_eq!(149_u32.rounding_div(100_u32, Rounding::Round).unwrap(), 1);
-        assert_eq!(150_u32.rounding_div(100_u32, Rounding::Round).unwrap(), 2);
-    }
 }
 
 /// `a * b` at scale difference `diff`, where `b` may be of a DIFFERENT inner type than `a`.
@@ -963,6 +875,7 @@ pub(crate) fn mul_ext_mixed<I: FpdecInner, J: FpdecInner>(a: I, b: J, diff: i32,
 
 /// `a / b` at scale difference `diff`, where `b` may be of a different inner type than `a`
 /// (see [`mul_ext_mixed`]): `0.0001 / 1000.00` is `0` in the result's scale, not `None`.
+#[inline(always)]
 pub(crate) fn div_ext_mixed<I: FpdecInner, J: FpdecInner>(a: I, b: J, diff: i32, rounding: Rounding) -> Option<I> {
     match I::from(b) {
         Some(b) => a.checked_div_ext(b, diff, rounding),

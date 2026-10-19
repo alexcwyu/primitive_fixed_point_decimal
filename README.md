@@ -34,6 +34,13 @@ Important:
   [benchmark](https://wubingzheng.github.io/en/Decimal-Crates-Comparison.html)
   for details.
 
+- Made for latency-sensitive code, where the text side counts as much as the
+  arithmetic: parsing is one pass over the bytes (`from_ascii` takes `&[u8]`
+  without a UTF-8 check), and `format_into` writes into your buffer without
+  `core::fmt`. Trading helpers are built in: `checked_rescale` between scales,
+  `checked_round_to_multiple` for tick sizes, `saturating_add`/`saturating_sub`
+  for limits.
+
 Less important, yet might also be what you need:
 
 - Supports scale larger than the significant digits of the underlying integer

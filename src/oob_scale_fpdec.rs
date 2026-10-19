@@ -84,7 +84,7 @@ where
     ///
     /// Argument: `diff_scale = scale(self) + scale(rhs) - scale(result)`.
     ///
-    /// If the diff_scale < 0, then rounding operations are required and
+    /// If the diff_scale > 0, then rounding operations are required and
     /// precision may be lost.
     /// You can specify the rounding type.
     ///
@@ -102,6 +102,14 @@ where
     /// assert_eq!(fee, fpdec!(0.12, 2));
     ///
     /// let fee: Balance = balance.checked_mul_ext(rate, 4, Rounding::Ceiling).unwrap();
+    ///
+    /// // Check which scale differences actually drop digits.
+    /// let unit = OobScaleFpdec::<i32>::from_mantissa(1);
+    /// for diff in [-1, 1] {
+    ///     let floor = unit.checked_mul_ext(unit, diff, Rounding::Floor).unwrap();
+    ///     let ceiling = unit.checked_mul_ext(unit, diff, Rounding::Ceiling).unwrap();
+    ///     assert_eq!(floor != ceiling, diff > 0);
+    /// }
     /// assert_eq!(fee, fpdec!(0.13, 2));
     /// ```
     #[must_use]
@@ -121,7 +129,8 @@ where
     ///
     /// Equivalent to [`Self::checked_mul_const_scale_ext`] with `Rounding::Round`.
     ///
-    /// If you make sure no overflow error, you can use `*` and `*=` instead for convenience.
+    /// You can use `*` and `*=` instead when the result fits and `S` is in the supported
+    /// range. Both operators panic if this method returns `None`.
     #[must_use]
     pub fn checked_mul_const_scale<J, const S: i32>(
         self,
@@ -134,7 +143,8 @@ where
     }
 
     /// Checked multiplication with `ConstScaleFpdec`. Computes `self * rhs`,
-    /// returning `None` if overflow occurred.
+    /// returning `None` if overflow occurred or the scale `S` of `rhs` is out of
+    /// range `[-Self::DIGITS, Self::DIGITS]`.
     ///
     /// Compared to [`Self::checked_mul_ext`], the result of this method inherits
     /// the scale of `self`. So the `diff_scale` (which is equal to `S`) is no
@@ -155,6 +165,10 @@ where
     ///
     /// let fee: Balance = balance.checked_mul_const_scale_ext(rate, Rounding::Ceiling).unwrap();
     /// assert_eq!(fee, fpdec!(0.13, 2));
+    ///
+    /// // `None` if the scale of `rhs` is out of range (`i64` has 18 digits)
+    /// let tiny = ConstScaleFpdec::<i16, 30>::from_mantissa(1);
+    /// assert_eq!(balance.checked_mul_const_scale(tiny), None);
     /// ```
     #[must_use]
     pub fn checked_mul_const_scale_ext<J, const S: i32>(
@@ -224,8 +238,8 @@ where
     ///
     /// Equivalent to [`Self::checked_div_const_scale_ext`] with `Rounding::Round`.
     ///
-    /// If you make sure no overflow or 0-division error, you can use `/` and `/=`
-    /// instead for convenience.
+    /// You can use `/` and `/=` instead when the divisor is non-zero, the result fits,
+    /// and `S` is in the supported range. Both operators panic if this method returns `None`.
     #[must_use]
     pub fn checked_div_const_scale<J, const S: i32>(
         self,
@@ -238,7 +252,8 @@ where
     }
 
     /// Checked division with `ConstScaleFpdec`. Computes `self / rhs`,
-    /// returning `None` if division by 0 or overflow occurred.
+    /// returning `None` if division by 0 or overflow occurred, or the scale `S`
+    /// of `rhs` is out of range `[-Self::DIGITS, Self::DIGITS]`.
     ///
     /// Compared to [`Self::checked_div_ext`], the result of this method inherits
     /// the scale of `self`. So the `diff_scale` (which is equal to `-S`) is no
@@ -257,6 +272,10 @@ where
     ///
     /// let balance: Balance = fee.checked_div_const_scale(rate).unwrap();
     /// assert_eq!(balance, fpdec!(12.0, 2));
+    ///
+    /// // `None` if the scale of `rhs` is out of range (`i64` has 18 digits)
+    /// let tiny = ConstScaleFpdec::<i16, 30>::from_mantissa(1);
+    /// assert_eq!(fee.checked_div_const_scale(tiny), None);
     /// ```
     #[must_use]
     pub fn checked_div_const_scale_ext<J, const S: i32>(
@@ -268,6 +287,35 @@ where
         J: FpdecInner,
     {
         div_ext_mixed(self.0, rhs.mantissa(), S.checked_neg()?, rounding).map(Self)
+    }
+
+    /// Convert to another scale.
+    ///
+    /// Equivalent to [`Self::checked_rescale_ext`] with `Rounding::Round`.
+    #[must_use]
+    pub fn checked_rescale(self, diff_scale: i32) -> Option<Self> {
+        self.checked_rescale_ext(diff_scale, Rounding::Round)
+    }
+
+    /// Convert to another scale: the same number, with the rounding you choose for the
+    /// digits that a smaller scale drops.
+    ///
+    /// The argument `diff_scale` is `original_scale - new_scale`. Returns `None`
+    /// if the result does not fit (`diff_scale < 0`).
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{OobScaleFpdec, Rounding, fpdec};
+    /// type Price = OobScaleFpdec<i64>;
+    ///
+    /// let p: Price = fpdec!(12.3456, 8); // scale=8
+    /// assert_eq!(p.checked_rescale_ext(8 - 2, Rounding::Floor), Some(fpdec!(12.34, 2)));
+    /// assert_eq!(p.checked_rescale(8 - 10), Some(fpdec!(12.3456, 10)));
+    /// ```
+    #[must_use]
+    pub fn checked_rescale_ext(self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
+        self.0
+            .checked_rescale_diff(diff_scale as i64, rounding)
+            .map(Self)
     }
 
     /// Round the decimal.
@@ -352,6 +400,48 @@ where
         I::try_from_str(s, scale).map(Self)
     }
 
+    /// Read decimal from ASCII bytes, with the scale set.
+    ///
+    /// The same as [`Self::try_from_str`], without making a `&str` first. Bytes that
+    /// are not UTF-8 are [`ParseError::Invalid`].
+    ///
+    /// Examples:
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{OobScaleFpdec, ParseError, fpdec};
+    /// type Decimal = OobScaleFpdec<i16>;
+    ///
+    /// assert_eq!(Decimal::try_from_ascii(b"1.23", 4).unwrap(), fpdec!(1.23, 4));
+    /// assert_eq!(Decimal::try_from_ascii(b"1.23456", 4), Err(ParseError::Precision));
+    /// ```
+    pub fn try_from_ascii(b: &[u8], scale: i32) -> Result<Self, ParseError>
+    where
+        I: Num<FromStrRadixErr = ParseIntError>,
+    {
+        I::try_from_ascii(b, scale).map(Self)
+    }
+
+    /// Format into `buf` and return the text, without `core::fmt`.
+    ///
+    /// The text is what [`OobFmt`]'s `Display` writes for the same `precision` (`{}` for `None`,
+    /// `{:.N}` for `Some(N)`), at a fraction of the time and without allocating. Returns `None`
+    /// if `buf` is too short, or if the scale or precision is beyond 200 (where `Display` panics).
+    ///
+    /// Examples:
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{OobScaleFpdec, fpdec};
+    ///
+    /// let mut buf = [0u8; 32];
+    /// let p: OobScaleFpdec<i64> = fpdec!(-12.5, 4);
+    /// assert_eq!(p.format_into(4, &mut buf, None), Some("-12.5"));
+    /// assert_eq!(p.format_into(4, &mut buf, Some(3)), Some("-12.500"));
+    /// ```
+    #[must_use]
+    pub fn format_into(self, scale: i32, buf: &mut [u8], precision: Option<usize>) -> Option<&str> {
+        self.0.format_into(scale, precision, buf)
+    }
+
     /// Convert into `f32`.
     ///
     /// Examples:
@@ -368,7 +458,12 @@ where
     /// ```
     #[must_use]
     pub fn to_f32(self, scale: i32) -> f32 {
-        crate::scale_f32(self.0.to_f32().unwrap(), scale.unsigned_abs(), scale > 0)
+        let f = self.0.to_f32().unwrap();
+        if f.is_infinite() && scale > 0 {
+            // Scale a u128 mantissa before narrowing it to f32.
+            return crate::scale_f64(self.0.to_f64().unwrap(), scale.unsigned_abs(), true) as f32;
+        }
+        crate::scale_f32(f, scale.unsigned_abs(), scale > 0)
     }
 
     /// Convert into `f64`.

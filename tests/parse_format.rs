@@ -303,6 +303,9 @@ where
     let name = T::NAME;
     // try_from_str, at every scale
     for &sc in scales {
+        // the bytes entry point is the same function with the UTF-8 step skipped
+        f.check(|| format!("{name} try_from_ascii"), || format!("{s:?} @{sc}"),
+            guarded(|| D::<T>::try_from_ascii(s.as_bytes(), sc)), guarded(|| D::<T>::try_from_str(s, sc)).unwrap());
         let got = guarded(|| D::<T>::try_from_str(s, sc).map(|v| v.mantissa().big()));
         let Ok(got) = got else {
             f.check(|| format!("{name} try_from_str PANIC"), || format!("{s:?} @{sc}"), Err::<(), ()>(()), ());
@@ -430,6 +433,14 @@ where
                 });
                 f.check(|| format!("{name} display prec={p:?}"), || format!("{m:?} @{sc}"), got, want.clone());
 
+                // `format_into` is the same text; it needs exactly `want.len()` bytes
+                let mut out = vec![0u8; want.len()];
+                f.check(|| format!("{name} format_into prec={p:?}"), || format!("{m:?} @{sc}"),
+                    Ok(dec.format_into(sc, &mut out, p).map(str::to_owned)), Some(want.clone()));
+                out.pop();
+                f.check(|| format!("{name} format_into one byte short prec={p:?}"), || format!("{m:?} @{sc}"),
+                    Ok(dec.format_into(sc, &mut out, p)), None);
+
                 // Padding / sign flags, on a few precisions only (they are orthogonal to the digits).
                 if matches!(p, None | Some(0) | Some(2)) && sc.abs() <= d + 2 {
                     let w = body.len() + 4;
@@ -546,4 +557,100 @@ fn spec_parse_hand_computed_table() {
     assert_eq!(s("", 0), Err(vec![Empty]));
     assert_eq!(spec_parse::<u8>("-0", 2), Ok(BigInt::from(0)));
     assert_eq!(spec_parse::<u8>("-1", 2), Err(vec![Invalid]));
+}
+
+// ---------------------------------------------------------------------------
+// The single-pass fast path of `try_from_str`
+// ---------------------------------------------------------------------------
+
+/// `try_from_str` first tries a branch-light single-pass parse and falls back to
+/// `try_from_str_exact` for everything it does not take. Whatever the fast path takes must be
+/// *the same Result* -- value and error kind -- so enumerate every string over an alphabet that
+/// covers digits, both signs, the point and junk, up to a length that crosses `DIGITS` for the
+/// narrow types, at the scales around zero.
+fn fast_path_agrees<I>(max_len: usize)
+where
+    I: primitive_fixed_point_decimal::FpdecInner + Num<FromStrRadixErr = ParseIntError> + core::fmt::Debug,
+{
+    const ALPHABET: [char; 8] = ['0', '1', '9', '5', '.', '-', '+', ' '];
+    let scales = [-3, -1, 0, 1, 2, 3, 5];
+    for len in 0..=max_len {
+        for n in 0..ALPHABET.len().pow(len as u32) {
+            // `n` in base 8 is the string
+            let s: String = (0..len).map(|i| ALPHABET[n / ALPHABET.len().pow(i as u32) % ALPHABET.len()]).collect();
+            for sc in scales {
+                assert_eq!(I::try_from_str(&s, sc), I::try_from_str_exact(&s, sc), "{s:?} @{sc}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_path_agrees_narrow_types() {
+    fast_path_agrees::<i8>(6);
+    fast_path_agrees::<u8>(6);
+    fast_path_agrees::<i16>(6);
+    fast_path_agrees::<u16>(6);
+}
+
+/// The wide types reach `DIGITS` only with long strings, which the exhaustive walk cannot
+/// enumerate; take the digit-count boundary from the generated corpus instead.
+#[test]
+fn fast_path_agrees_at_the_digit_limit() {
+    fn run<I>(digits: usize)
+    where
+        I: primitive_fixed_point_decimal::FpdecInner + Num<FromStrRadixErr = ParseIntError> + core::fmt::Debug,
+    {
+        for n in digits.saturating_sub(2)..=digits + 2 {
+            for fill in ['0', '1', '9'] {
+                for point in 0..=n {
+                    for sign in ["", "-", "+"] {
+                        let mut s = String::from(sign);
+                        for i in 0..n {
+                            if i == point && point != 0 { s.push('.'); }
+                            s.push(fill);
+                        }
+                        for sc in [-2, 0, 1, 7, 18, 19, 20, 38, 39] {
+                            assert_eq!(I::try_from_str(&s, sc), I::try_from_str_exact(&s, sc), "{s:?} @{sc}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    run::<i32>(9);
+    run::<u32>(9);
+    run::<i64>(18);
+    run::<u64>(19);
+    run::<i128>(38);
+    run::<u128>(38);
+}
+
+#[test]
+fn format_into_refuses_what_display_panics_on() {
+    let d = D::<i64>::from_mantissa(12345);
+    let mut buf = [0u8; 512];
+    assert!(d.format_into(200, &mut buf, None).is_some());
+    assert_eq!(d.format_into(201, &mut buf, None), None);
+    assert_eq!(d.format_into(-201, &mut buf, None), None);
+    assert_eq!(d.format_into(i32::MIN, &mut buf, None), None); // `abs()` of it overflows
+    assert!(d.format_into(2, &mut buf, Some(200)).is_some());
+    assert_eq!(d.format_into(2, &mut buf, Some(201)), None);
+    assert!(d.format_into(-60, &mut buf, Some(140)).is_some()); // 60 + 140
+    assert_eq!(d.format_into(-60, &mut buf, Some(141)), None);
+    // `precision + |scale|` must not wrap
+    for (scale, p) in [(-1, usize::MAX), (-5, usize::MAX - 4), (-200, usize::MAX - 115), (0, usize::MAX), (7, usize::MAX)] {
+        assert_eq!(d.format_into(scale, &mut buf, Some(p)), None, "{scale} {p}");
+    }
+    assert_eq!(d.format_into(0, &mut [], None), None);
+}
+
+#[test]
+fn from_ascii_rejects_non_utf8_as_invalid() {
+    type D8 = D<i64>;
+    assert_eq!(D8::try_from_ascii(b"1.2\xff", 4), Err(ParseError::Invalid));
+    assert_eq!(D8::try_from_ascii(b"\xff", 4), Err(ParseError::Invalid));
+    assert_eq!(D8::try_from_ascii(b"", 4), Err(ParseError::Empty));
+    // a multi-byte UTF-8 digit is a character that is not an ASCII digit
+    assert_eq!(D8::try_from_ascii("１２".as_bytes(), 0), Err(ParseError::Invalid));
 }

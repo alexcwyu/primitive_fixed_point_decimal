@@ -142,7 +142,19 @@ macro_rules! pow10_scaler {
     ($name:ident, $float:ty, $chunk:expr) => {
         pub(crate) fn $name(mut f: $float, n: u32, divide: bool) -> $float {
             let step = |f: $float, n: u32| {
-                let p = (10.0 as $float).powi(n as i32);
+                // LLVM powi can differ at runtime and when constant-folded. FloatCore::powi
+                // forwards to that intrinsic when num-traits/std is enabled, too.
+                // Plain IEEE multiplications keep scaling identical across build profiles.
+                let (mut base, mut exponent, mut p) = (10.0 as $float, n, 1.0 as $float);
+                while exponent != 0 {
+                    if exponent & 1 != 0 {
+                        p *= base;
+                    }
+                    exponent >>= 1;
+                    if exponent != 0 {
+                        base *= base;
+                    }
+                }
                 if divide { f / p } else { f * p }
             };
             let mut n = n;

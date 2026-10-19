@@ -59,12 +59,48 @@ where
     /// The static scale.
     pub const SCALE: i32 = S;
 
+    /// Format into `buf` and return the text, without `core::fmt`.
+    ///
+    /// The text is what [`Display`](fmt::Display) writes for the same `precision`
+    /// (`{}` for `None`, `{:.N}` for `Some(N)`), at a fraction of the time
+    /// and without allocating. Returns `None` if `buf` is too short, or if the scale or
+    /// precision is beyond 200 (where `Display` panics).
+    ///
+    /// Examples:
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec, fpdec};
+    /// type Price = ConstScaleFpdec<i64, 4>;
+    ///
+    /// let mut buf = [0u8; 32];
+    /// let p: Price = fpdec!(-12.5);
+    /// assert_eq!(p.format_into(&mut buf, None), Some("-12.5"));
+    /// assert_eq!(p.format_into(&mut buf, Some(3)), Some("-12.500"));
+    /// assert_eq!(p.format_into(&mut buf[..4], None), None); // too short
+    /// ```
+    #[must_use]
+    pub fn format_into(self, buf: &mut [u8], precision: Option<usize>) -> Option<&str> {
+        self.0.format_into(S, precision, buf)
+    }
+
     /// Checked multiplication.
     ///
     /// Equivalent to [`Self::checked_mul_ext`] with `Rounding::Round`.
     ///
-    /// If you make sure no overflow error, and the result type has the same
-    /// scale (`SR`=`S`), you can use `*` and `*=` instead for convenience.
+    /// If the result type has the same scale (`SR`=`S`), you can use `*` and `*=`
+    /// instead when the result fits and the scale difference is in the supported range.
+    /// Both operators panic if this method returns `None`, even for a zero product.
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec as C, OobScaleFpdec as D};
+    /// let rhs = C::<i8, 3>::ZERO;
+    /// let zero = C::<i8, 0>::ZERO;
+    /// assert_eq!(zero.checked_mul::<_, 3, 0>(rhs), None); // diff 3 exceeds i8::DIGITS
+    /// assert!(std::panic::catch_unwind(|| zero * rhs).is_err()); // exact zero still panics
+    /// let zero = D::<i8>::ZERO;
+    /// assert_eq!(zero.checked_mul_const_scale(rhs), None);
+    /// assert!(std::panic::catch_unwind(|| zero * rhs).is_err());
+    /// ```
     #[must_use]
     pub fn checked_mul<J, const S2: i32, const SR: i32>(
         self,
@@ -122,9 +158,20 @@ where
     ///
     /// Equivalent to [`Self::checked_div_ext`] with `Rounding::Round`.
     ///
-    /// If you make sure no overflow or 0-division error, and the result type
-    /// has the same scale (`SR`=`S`), you can use `/` and `/=` instead for
-    /// convenience.
+    /// If the result type has the same scale (`SR`=`S`), you can use `/` and `/=`
+    /// instead when the divisor is non-zero, the result fits, and the scale difference
+    /// is in the supported range. Both operators panic if this method returns `None`.
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec as C, OobScaleFpdec as D};
+    /// let rhs = C::<i8, 3>::from_mantissa(1); // non-zero divisor; exact quotient is zero
+    /// let zero = C::<i8, 0>::ZERO;
+    /// assert_eq!(zero.checked_div::<_, 3, 0>(rhs), None); // diff -3 is unsupported
+    /// assert!(std::panic::catch_unwind(|| zero / rhs).is_err());
+    /// let zero = D::<i8>::ZERO;
+    /// assert_eq!(zero.checked_div_const_scale(rhs), None);
+    /// assert!(std::panic::catch_unwind(|| zero / rhs).is_err());
+    /// ```
     #[must_use]
     pub fn checked_div<J, const S2: i32, const SR: i32>(
         self,
@@ -169,6 +216,42 @@ where
         J: FpdecInner,
     {
         div_ext_mixed(self.0, rhs.0, scale_diff(S as i64 - S2 as i64 - SR as i64)?, rounding)
+            .map(ConstScaleFpdec)
+    }
+
+    /// Convert to another scale `SR`.
+    ///
+    /// Equivalent to [`Self::checked_rescale_ext`] with `Rounding::Round`.
+    #[must_use]
+    pub fn checked_rescale<const SR: i32>(self) -> Option<ConstScaleFpdec<I, SR>> {
+        self.checked_rescale_ext(Rounding::Round)
+    }
+
+    /// Convert to another scale `SR`: the same number, with the rounding you choose
+    /// for the digits that a smaller `SR` drops.
+    ///
+    /// Returns `None` if the result does not fit `I` (`SR > S`).
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec, Rounding, fpdec};
+    /// type Price = ConstScaleFpdec<i64, 8>;
+    /// type Tick = ConstScaleFpdec<i64, 2>;
+    ///
+    /// let p: Price = fpdec!(12.3456);
+    /// assert_eq!(p.checked_rescale_ext::<2>(Rounding::Floor), Some(fpdec!(12.34)));
+    /// assert_eq!(p.checked_rescale::<2>(), Some(fpdec!(12.35)));
+    /// assert_eq!(p.checked_rescale::<10>(), Some(fpdec!(12.3456)));
+    ///
+    /// let big: Price = fpdec!(1e10);
+    /// assert_eq!(big.checked_rescale::<10>(), None); // 1e20 does not fit an i64
+    /// ```
+    #[must_use]
+    pub fn checked_rescale_ext<const SR: i32>(
+        self,
+        rounding: Rounding,
+    ) -> Option<ConstScaleFpdec<I, SR>> {
+        self.0
+            .checked_rescale_diff(S as i64 - SR as i64, rounding)
             .map(ConstScaleFpdec)
     }
 
@@ -318,6 +401,32 @@ where
     }
 }
 
+impl<I, const S: i32> ConstScaleFpdec<I, S>
+where
+    I: FpdecInner + Num<FromStrRadixErr = ParseIntError>,
+{
+    /// Read decimal from ASCII bytes.
+    ///
+    /// The same as [`FromStr`], without making a `&str` first: feeds deliver
+    /// bytes, and checking them for UTF-8 only to take the text apart again
+    /// costs more than the parse. Bytes that are not UTF-8 are
+    /// [`ParseError::Invalid`], like any other character that is not a digit.
+    ///
+    /// Examples:
+    ///
+    /// ```
+    /// use primitive_fixed_point_decimal::{ConstScaleFpdec, ParseError, fpdec};
+    /// type Price = ConstScaleFpdec<i64, 4>;
+    ///
+    /// assert_eq!(Price::from_ascii(b"-12.5"), Ok(fpdec!(-12.5)));
+    /// assert_eq!(Price::from_ascii(b"1.23456"), Err(ParseError::Precision));
+    /// assert_eq!(Price::from_ascii(b"1.2\xff"), Err(ParseError::Invalid));
+    /// ```
+    pub fn from_ascii(b: &[u8]) -> Result<Self, ParseError> {
+        I::try_from_ascii(b, S).map(Self)
+    }
+}
+
 impl<I, const S: i32> From<OobScaleFpdec<I>> for ConstScaleFpdec<I, S>
 where
     I: FpdecInner,
@@ -448,6 +557,11 @@ macro_rules! convert_from_float {
             /// ```
             fn from(dec: ConstScaleFpdec<I, S>) -> Self {
                 let f = dec.0.$to_fn().unwrap();
+                if f.is_infinite() && S > 0 {
+                    // A u128 mantissa can overflow f32 even when the scaled decimal fits.
+                    return crate::scale_f64(dec.0.to_f64().unwrap(), S.unsigned_abs(), true)
+                        as $float_type;
+                }
                 $scale(f, S.unsigned_abs(), S > 0)
             }
         }
@@ -1053,75 +1167,6 @@ mod tests {
         assert_eq!(Dec32n2::from_str("-1000"), Ok(fpdec!(-1000)));
         assert_eq!(Dec32n2::from_str("1000.00"), Err(ParseError::Precision));
         assert_eq!(Dec32n2::from_str("1001"), Err(ParseError::Precision));
-    }
-
-    // used for testing format
-    struct Buffer {
-        data: [u8; 100],
-        len: usize,
-    }
-    impl Buffer {
-        fn new() -> Self {
-            Buffer {
-                data: [0; 100],
-                len: 0,
-            }
-        }
-        fn as_str(&self) -> &str {
-            unsafe { core::str::from_utf8_unchecked(&self.data[..self.len]) }
-        }
-    }
-    use core::fmt::Write;
-    impl Write for Buffer {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            let bytes = s.as_bytes();
-            if self.len + bytes.len() > self.data.len() {
-                return Err(fmt::Error);
-            }
-            self.data[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-            self.len += bytes.len();
-            Ok(())
-        }
-    }
-
-    type Dec64p7 = ConstScaleFpdec<i64, 7>;
-    fn do_check_fmt(f: f64) {
-        let mut buf = Buffer::new();
-        let dec: Dec64p7 = fpdec!(f);
-        write!(buf, "{dec}").unwrap();
-        let dec2: Dec64p7 = Dec64p7::from_str(buf.as_str()).unwrap();
-        assert_eq!(dec, dec2);
-
-        //
-        let mut buf = Buffer::new();
-        let dec: Dec64p7 = fpdec!(-f);
-        write!(buf, "{dec:.7}").unwrap();
-        let dec2: Dec64p7 = Dec64p7::from_str(buf.as_str()).unwrap();
-        assert_eq!(dec, dec2);
-
-        //
-        let mut buf = Buffer::new();
-        let dec: Dec64p7 = fpdec!(-f);
-        write!(buf, "{dec}").unwrap();
-        let dec2: Dec64p7 = Dec64p7::from_str(buf.as_str()).unwrap();
-        assert_eq!(dec, dec2);
-    }
-
-    #[test]
-    fn test_fmt2() {
-        do_check_fmt(0.0);
-        do_check_fmt(1.0);
-        do_check_fmt(123.0);
-        do_check_fmt(123.456);
-        do_check_fmt(123.4567);
-        do_check_fmt(123.002);
-        do_check_fmt(123.00002);
-        do_check_fmt(123.0000002);
-        do_check_fmt(0.456);
-        do_check_fmt(0.4567);
-        do_check_fmt(0.002);
-        do_check_fmt(0.00002);
-        do_check_fmt(0.0000002);
     }
 
     #[test]

@@ -94,6 +94,29 @@ impl FpdecInner for i32 {
 
         ALL_EXPS.get(i).copied()
     }
+
+    // The product fits i64. Add the rounding extra to its magnitude before
+    // dividing: this avoids a signed quotient/remainder pair on the hot path.
+    #[inline]
+    fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
+        let exp = Self::get_exp(i)? as u64;
+        let p = self as i64 * b as i64;
+        let negative = p < 0;
+        let extra = match rounding {
+            Rounding::TowardsZero => 0,
+            Rounding::AwayFromZero => exp - 1,
+            Rounding::Floor => if negative { exp - 1 } else { 0 },
+            Rounding::Ceiling => if negative { 0 } else { exp - 1 },
+            Rounding::Round => exp / 2,
+        };
+        // |p| <= 2^62 and extra < 10^9, so the addition cannot overflow u64.
+        let q = (p.unsigned_abs() + extra) / exp;
+        if negative {
+            (q <= 1 << 31).then(|| (q as u32).wrapping_neg() as i32)
+        } else {
+            i32::try_from(q).ok()
+        }
+    }
 }
 
 impl FpdecInner for i64 {
@@ -125,8 +148,45 @@ impl FpdecInner for i64 {
         ALL_EXPS.get(i).copied()
     }
 
+    // The default goes through a signed `i128` division, which is two library calls (quotient
+    // and remainder) plus sign fix-ups. On the magnitudes it is one `u128 / u64`.
+    #[inline]
+    fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
+        let uc = c.unsigned_abs();
+        if uc == 0 {
+            return None;
+        }
+        let is_neg = (self ^ b ^ c) < 0;
+
+        let p = self.unsigned_abs() as u128 * b.unsigned_abs() as u128;
+        let (q, r) = match u64::try_from(p) {
+            Ok(p) => ((p / uc) as u128, p % uc),
+            Err(_) => (p / uc as u128, (p % uc as u128) as u64),
+        };
+
+        // `r < uc`, so neither `uc - r` nor `q + 1` can overflow.
+        let up = r != 0
+            && match rounding {
+                Rounding::TowardsZero => false,
+                Rounding::AwayFromZero => true,
+                Rounding::Floor => is_neg,
+                Rounding::Ceiling => !is_neg,
+                Rounding::Round => r >= uc - r,
+            };
+        let q = q + up as u128;
+
+        if is_neg {
+            (q <= 1 << 63).then(|| (q as u64).wrapping_neg() as i64)
+        } else {
+            i64::try_from(q).ok()
+        }
+    }
+
     #[inline]
     fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
+        if i == 0 {
+            return self.checked_mul(b);
+        }
         let exp = Self::get_exp(i)?;
 
         let ua = self.unsigned_abs();
@@ -245,7 +305,33 @@ impl FpdecInner for u64 {
         ALL_EXPS.get(i).copied()
     }
 
+    // See the `i64` one.
+    #[inline]
+    fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
+        if c == 0 {
+            return None;
+        }
+        let p = self as u128 * b as u128;
+        let (q, r) = match u64::try_from(p) {
+            Ok(p) => ((p / c) as u128, p % c),
+            Err(_) => (p / c as u128, (p % c as u128) as u64),
+        };
+
+        // `r < c`, so neither `c - r` nor `q + 1` can overflow.
+        let up = r != 0
+            && match rounding {
+                Rounding::Floor | Rounding::TowardsZero => false,
+                Rounding::Ceiling | Rounding::AwayFromZero => true,
+                Rounding::Round => r >= c - r,
+            };
+        u64::try_from(q + up as u128).ok()
+    }
+
+    #[inline]
     fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
+        if i == 0 {
+            return self.checked_mul(b);
+        }
         let exp = Self::get_exp(i)?;
 
         let extra = match rounding {
@@ -273,110 +359,5 @@ impl FpdecInner for u64 {
 
         let divident = self as u128 * b as u128 + extra as u128;
         bit64::div_double(divident, i as u32).map(|(q, _r)| q)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn do_test_calc_mul_div(a: u64, b: u64, exp: u64, iexp: usize) {
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-    }
-
-    fn do_test_calc_mul_div_signed(a: i64, b: i64, exp: i64, iexp: usize) {
-        // +-
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-
-        // --
-        let a = -a;
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-
-        // ++
-        let b = b.wrapping_neg();
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-    }
-
-    #[test]
-    fn test_calc_mul_div() {
-        for iexp in 1..20 {
-            let exp = 10_u64.pow(iexp);
-
-            for i in 0..iexp {
-                let a = exp - i as u64;
-
-                // enlarge this range for more test
-                for j in 0..1000 {
-                    let b = u64::MAX - j * 113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-                for j in 0..1000 {
-                    let b = u64::MAX - j * 11113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-
-                // small values
-                for j in 0..1000 {
-                    let b = u32::MAX as u64 - j * 113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-            }
-        }
-
-        for iexp in 1..19 {
-            let exp = 10_i64.pow(iexp);
-
-            for i in 0..iexp {
-                let a = exp - i as i64;
-
-                // enlarge this range for more test
-                for j in 0..1000 {
-                    let b = i64::MIN + j * 113;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-                for j in 0..1000 {
-                    let b = i64::MIN + j * 111113;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-
-                // small values
-                for j in 0..1000 {
-                    let b = i32::MIN as i64 + j * 113;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-            }
-        }
     }
 }

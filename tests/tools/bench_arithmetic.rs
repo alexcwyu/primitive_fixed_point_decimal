@@ -1,0 +1,245 @@
+// Build and compare using python3 tests/tools/bench_arithmetic.py.
+// ALT_BUILD selects straightforward correct primitive implementations; otherwise
+// benchmark the public decimal APIs on realistic small price/quantity mantissas.
+use primitive_fixed_point_decimal::{
+    ConstScaleFpdec as C, FpdecInner, OobScaleFpdec as D, Rounding,
+};
+use std::{hint::black_box, time::Instant};
+fn bench<T: Copy, F: FnMut(T, T) -> T>(name: &str, data: &[(T, T)], mut f: F) {
+    let mut acc = 0;
+    for _ in 0..100 {
+        for &(a, b) in data {
+            black_box(f(a, b));
+        }
+    }
+    let n = 15_000_000;
+    let start = Instant::now();
+    for i in 0..n {
+        let (a, b) = data[i & 1023];
+        black_box(f(black_box(a), black_box(b)));
+        acc += 1;
+    }
+    black_box(acc);
+    println!(
+        "{name:<42} {:.2} ns/op",
+        start.elapsed().as_nanos() as f64 / n as f64
+    );
+}
+fn simple<W: FpdecInner>(a: W, b: W) -> Option<W> {
+    let q = a.checked_div(&b)?;
+    let rem = a % b;
+    let (r, d) = (rem.unsigned_abs(), b.unsigned_abs());
+    if r >= d - r {
+        if (a < W::ZERO) != (b < W::ZERO) {
+            q.checked_sub(&W::ONE)
+        } else {
+            q.checked_add(&W::ONE)
+        }
+    } else {
+        Some(q)
+    }
+}
+fn main() {
+    let alt = option_env!("ALT_BUILD").is_some();
+    let mut rng = 123456789u64;
+    macro_rules! test {
+        ($t:ty) => {
+            let data: Vec<($t, $t)> = (0..1024)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let a = (rng % 100_000_000) as $t;
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    (a, (rng % 65535 + 1) as $t)
+                })
+                .collect();
+            bench(concat!(stringify!($t), " add"), &data, |a, b| {
+                if alt {
+                    a.checked_add(b).unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_add(C::from_mantissa(b))
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " sub"), &data, |a, b| {
+                if alt {
+                    a.checked_sub(b).unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_sub(C::from_mantissa(b))
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " mul_int"), &data, |a, b| {
+                if alt {
+                    a.checked_mul(b).unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_mul_int(b)
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " rescale drop"), &data, |a, _| {
+                if alt {
+                    a.rounding_div(100, Rounding::Round).unwrap()
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_rescale::<2>()
+                        .unwrap()
+                        .mantissa()
+                }
+            });
+            bench(concat!(stringify!($t), " rescale grow"), &data, |a, _| {
+                if alt {
+                    a.checked_mul(100).unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_rescale::<6>()
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(
+                concat!(stringify!($t), " oob rescale drop"),
+                &data,
+                |a, _| {
+                    if alt {
+                        a.rounding_div(100, Rounding::Round).unwrap()
+                    } else {
+                        D::<$t>::from_mantissa(a)
+                            .checked_rescale(2)
+                            .unwrap()
+                            .mantissa()
+                    }
+                },
+            );
+            bench(concat!(stringify!($t), " round multiple"), &data, |a, b| {
+                if alt {
+                    a.rounding_div(b, Rounding::Round)
+                        .and_then(|q| q.checked_mul(b))
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_round_to_multiple(C::from_mantissa(b))
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+        };
+    }
+    test!(i32);
+    test!(i64);
+    test!(u64);
+    test!(i128);
+    macro_rules! extra {
+        ($t:ty,$w:ty) => {
+            let data: Vec<($t, $t)> = (0..1024)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let a = (rng % 100_000_000) as $t;
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    (a, (rng % 65535 + 1) as $t)
+                })
+                .collect();
+            bench(concat!(stringify!($t), " decimal mul"), &data, |a, b| {
+                if alt {
+                    simple(a as $w * b as $w, 10000)
+                        .and_then(|q| <$t>::try_from(q).ok())
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_mul::<_, 4, 4>(C::from_mantissa(b))
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " decimal div"), &data, |a, b| {
+                if alt {
+                    simple(a as $w * 10000, b as $w)
+                        .and_then(|q| <$t>::try_from(q).ok())
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_div::<_, 4, 4>(C::from_mantissa(b))
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " div_int"), &data, |a, b| {
+                if alt {
+                    simple(a as $w, b as $w)
+                        .and_then(|q| <$t>::try_from(q).ok())
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_div_int(b)
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " mul_ratio"), &data, |a, b| {
+                if alt {
+                    simple(a as $w * b as $w, 65537)
+                        .and_then(|q| <$t>::try_from(q).ok())
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_mul_ratio(b, 65537 as $t)
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+            bench(concat!(stringify!($t), " round"), &data, |a, _| {
+                if alt {
+                    simple(a as $w, 100)
+                        .and_then(|q| <$t>::try_from(q * 100).ok())
+                        .unwrap_or(0)
+                } else {
+                    C::<$t, 4>::from_mantissa(a)
+                        .checked_round(2)
+                        .map_or(0, |x| x.mantissa())
+                }
+            });
+        };
+    }
+    extra!(i32, i64);
+    extra!(i64, i128);
+    extra!(u64, u128);
+    i32_div_signs(alt);
+}
+
+// Sign-diverse runtime decimal division, with the same operand barriers on both paths.
+fn i32_div_signs(alt: bool) {
+    let mut rng = 0x9e3779b97f4a7c15u64;
+    let mut next = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+    for regime in ["positive", "signs", "wide"] {
+        let data: Vec<(i32, i32)> = (0..1024).map(|_| {
+            let a = if regime == "wide" { next() as i32 } else { (next() % 100_000_000) as i32 };
+            let b = if regime == "wide" { next() as i32 } else { (next() % 65535 + 1) as i32 };
+            if regime == "signs" { (a * if next() & 1 == 0 { -1 } else { 1 }, b * if next() & 1 == 0 { -1 } else { 1 }) } else { (a, b) }
+        }).collect();
+        // Compare the Option, not map_or(0), outside the timed loop. Zero divisors,
+        // exact zero, ties, negative divisors and representable/overflow limits.
+        for (a, b) in data.iter().copied().chain([(0,0),(0,-1),(1,32),(-1,32),(1,-32),(-1,-32),(i32::MIN,-1),(i32::MIN,10000),(i32::MAX,10000)]) {
+            let reference = simple(a as i64 * 10000, b as i64).and_then(|q| i32::try_from(q).ok());
+            let decimal = C::<i32,4>::from_mantissa(a).checked_div::<_,4,4>(C::from_mantissa(b)).map(|x|x.mantissa());
+            assert_eq!(decimal, reference, "i32 div {a}/{b}");
+        }
+        let n = 15_000_000;
+        let mut acc = 0u64;
+        let start = Instant::now();
+        for i in 0..n {
+            let (a,b) = data[i & 1023];
+            let q = if alt {
+                simple(a as i64 * 10000, black_box(b) as i64).and_then(|q|i32::try_from(q).ok())
+            } else {
+                C::<i32,4>::from_mantissa(a).checked_div::<_,4,4>(black_box(C::from_mantissa(b))).map(|x|x.mantissa())
+            };
+            acc = acc.wrapping_add(q.unwrap_or(0) as u64);
+        }
+        black_box(acc);
+        println!("{:<42} {:.2} ns/op", format!("i32 decimal div {regime}"), start.elapsed().as_nanos() as f64 / n as f64);
+    }
+}

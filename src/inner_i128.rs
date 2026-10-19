@@ -140,6 +140,9 @@ impl FpdecInner for i128 {
 
     #[inline]
     fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
+        if i == 0 {
+            return self.checked_mul(b);
+        }
         let exp = Self::get_exp(i)?;
 
         let ua = self.unsigned_abs();
@@ -178,6 +181,7 @@ impl FpdecInner for i128 {
         Some(if is_pos { iq } else { iq.wrapping_neg() })
     }
 
+    #[inline(always)]
     fn rounding_div(self, b: Self, rounding: Rounding) -> Option<Self> {
         // try 64-bit first, which is much faster
         if let Ok(a64) = i64::try_from(self) {
@@ -287,7 +291,11 @@ impl FpdecInner for u128 {
         q.checked_add(last_q)
     }
 
+    #[inline]
     fn calc_mul_div_exp(self, b: Self, i: usize, rounding: Rounding) -> Option<Self> {
+        if i == 0 {
+            return self.checked_mul(b);
+        }
         let exp = Self::get_exp(i)?;
 
         let extra = match rounding {
@@ -308,6 +316,7 @@ impl FpdecInner for u128 {
         }
     }
 
+    #[inline]
     fn rounding_div(self, b: Self, rounding: Rounding) -> Option<Self> {
         // try 64-bit first, which is much faster
         if let Ok(a64) = u64::try_from(self) {
@@ -420,288 +429,4 @@ fn reduce2_big(mhigh: u128, mlow: u128, divisor: u128) -> Option<(u128, u128)> {
     }
 
     Some((dividend, q))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn check_calc_mul_div(a: i128, b: i128, c: i128) {
-        // calc
-        let Some(q) = a.calc_mul_div(b, c, Rounding::TowardsZero) else {
-            return;
-        };
-
-        if q != 0 {
-            assert_eq!(q >= 0, (a ^ b ^ c) >= 0);
-        }
-
-        let (x1, x2) = mul2(a.unsigned_abs(), b.unsigned_abs());
-        let (y1, y2) = mul2(c.unsigned_abs(), q.unsigned_abs());
-
-        let remain = if x1 == y1 {
-            assert!(x2 >= y2);
-            x2 - y2
-        } else {
-            assert!(x1 - 1 == y1);
-            assert!(x2 < y2);
-            u128::MAX - y2 + x2 + 1
-        };
-
-        assert!(remain < c.unsigned_abs());
-    }
-
-    fn check_calc_mul_div_signs(a: i128, b: i128, c: i128) {
-        check_calc_mul_div(a, b, c);
-        check_calc_mul_div(-a, b, c);
-        check_calc_mul_div(a, b, -c);
-        check_calc_mul_div(-a, b, -c);
-    }
-
-    #[test]
-    fn test_mul_div_some() {
-        check_calc_mul_div_signs(120, 7, 14);
-        check_calc_mul_div_signs(120, 7, 17);
-    }
-    #[test]
-    fn test_mul_div_big() { // TODO
-    }
-    #[test]
-    fn test_mul_div_list() {
-        let nums = [
-            4,
-            101,
-            256,
-            9999999,
-            10000000,
-            100000003,
-            i32::MAX as i128,
-            i32::MAX as i128 + 1,
-            i32::MAX as i128 + 2,
-            i32::MAX as i128 * 2 + 7,
-            i64::MAX as i128,
-            i64::MAX as i128 + 1,
-            i64::MAX as i128 + 2,
-            i64::MAX as i128 * 2 + 7,
-            i128::MAX / 127,
-            i128::MAX / 2,
-            i128::MAX - 3,
-            i128::MAX,
-        ];
-        let num2 = [
-            1,
-            3,
-            7,
-            10,
-            100,
-            10000,
-            9999999,
-            i32::MAX as i128,
-            i64::MAX as i128,
-        ];
-        for a in nums {
-            for c in nums {
-                check_calc_mul_div_signs(a, a, c);
-                check_calc_mul_div_signs(a, c, c);
-                check_calc_mul_div_signs(a, c, a);
-                for rat in num2 {
-                    check_calc_mul_div_signs(a, a - rat, c - rat);
-                    check_calc_mul_div_signs(a, a - rat, c / rat);
-                    check_calc_mul_div_signs(a, a / rat, c / rat);
-                    check_calc_mul_div_signs(a, a / rat, c - rat);
-
-                    check_calc_mul_div_signs(a, c - rat, c - rat);
-                    check_calc_mul_div_signs(a, c - rat, c / rat);
-                    check_calc_mul_div_signs(a, c / rat, c / rat);
-                    check_calc_mul_div_signs(a, c / rat, c - rat);
-
-                    check_calc_mul_div_signs(a, c - rat, a - rat);
-                    check_calc_mul_div_signs(a, c - rat, a / rat);
-                    check_calc_mul_div_signs(a, c / rat, a / rat);
-                    check_calc_mul_div_signs(a, c / rat, a - rat);
-                }
-            }
-        }
-    }
-
-    // --- unsigned
-
-    fn check_calc_mul_div_unsigned(a: u128, b: u128, c: u128) {
-        // calc
-        let Some(q) = a.calc_mul_div(b, c, Rounding::Floor) else {
-            return;
-        };
-
-        let (x1, x2) = mul2(a, b);
-        let (y1, y2) = mul2(c, q);
-
-        let remain = if x1 == y1 {
-            assert!(x2 >= y2);
-            x2 - y2
-        } else {
-            assert!(x1 - 1 == y1);
-            assert!(x2 < y2);
-            u128::MAX - y2 + x2 + 1
-        };
-        assert!(remain < c);
-    }
-
-    #[test]
-    fn test_mul_div_list_unsigned() {
-        let nums = [
-            4,
-            101,
-            256,
-            9999999,
-            10000000,
-            100000003,
-            u32::MAX as u128,
-            u32::MAX as u128 + 1,
-            u32::MAX as u128 + 2,
-            u32::MAX as u128 * 2 + 7,
-            u64::MAX as u128,
-            u64::MAX as u128 + 1,
-            u64::MAX as u128 + 2,
-            u64::MAX as u128 * 2 + 7,
-            u128::MAX / 127,
-            u128::MAX / 2,
-            u128::MAX - 3,
-            u128::MAX,
-        ];
-        let num2 = [
-            1,
-            3,
-            7,
-            10,
-            100,
-            10000,
-            9999999,
-            u32::MAX as u128,
-            u64::MAX as u128,
-        ];
-        for a in nums {
-            for c in nums {
-                check_calc_mul_div_unsigned(a, a, c);
-                check_calc_mul_div_unsigned(a, c, c);
-                check_calc_mul_div_unsigned(a, c, a);
-                for rat in num2 {
-                    let a2 = a.wrapping_sub(rat);
-                    let c2 = c.wrapping_sub(rat);
-                    check_calc_mul_div_unsigned(a, a2, c2);
-                    check_calc_mul_div_unsigned(a, a2, c / rat);
-                    check_calc_mul_div_unsigned(a, a / rat, c / rat);
-                    check_calc_mul_div_unsigned(a, a / rat, c2);
-
-                    check_calc_mul_div_unsigned(a, c2, c2);
-                    check_calc_mul_div_unsigned(a, c2, c / rat);
-                    check_calc_mul_div_unsigned(a, c / rat, c / rat);
-                    check_calc_mul_div_unsigned(a, c / rat, c2);
-
-                    check_calc_mul_div_unsigned(a, c2, a2);
-                    check_calc_mul_div_unsigned(a, c2, a / rat);
-                    check_calc_mul_div_unsigned(a, c / rat, a / rat);
-                    check_calc_mul_div_unsigned(a, c / rat, a2);
-                }
-            }
-        }
-    }
-
-    fn do_test_calc_mul_div(a: u128, b: u128, exp: u128, iexp: usize) {
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-    }
-
-    fn do_test_calc_mul_div_signed(a: i128, b: i128, exp: i128, iexp: usize) {
-        // +-
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-
-        // --
-        let a = -a;
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-
-        // ++
-        let b = b.wrapping_neg();
-        let q1 = a.calc_mul_div(b, exp, Rounding::Floor);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Floor);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Ceiling);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Ceiling);
-        assert_eq!(q1, q2);
-        let q1 = a.calc_mul_div(b, exp, Rounding::Round);
-        let q2 = a.calc_mul_div_exp(b, iexp, Rounding::Round);
-        assert_eq!(q1, q2);
-    }
-
-    #[test]
-    fn test_calc_mul_div() {
-        for iexp in 1..39 {
-            let exp = 10_u128.pow(iexp);
-
-            for i in 0..iexp {
-                let a = exp - i as u128;
-
-                // enlarge this range for more test
-                for j in 0..1000 {
-                    let b = u128::MAX - j * 113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-                for j in 0..1000 {
-                    let b = u128::MAX - j * 11113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-
-                // small values
-                for j in 0..1000 {
-                    let b = u64::MAX as u128 - j * 113;
-                    do_test_calc_mul_div(a, b, exp, iexp as usize);
-                }
-            }
-
-            // signed
-            let exp = 10_i128.pow(iexp);
-
-            for i in 0..iexp {
-                let a = exp - i as i128;
-
-                // enlarge this range for more test
-                for j in 0..1000 {
-                    let b = i128::MIN + j * 113 + 1;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-                for j in 0..1000 {
-                    let b = i128::MIN + j * 111113 + 1;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-
-                // small values
-                for j in 0..1000 {
-                    let b = i64::MIN as i128 + j * 113;
-                    do_test_calc_mul_div_signed(a, b, exp, iexp as usize);
-                }
-            }
-        }
-    }
 }

@@ -820,3 +820,101 @@ fn trailing_zero_policy_is_textual() {
     assert_eq!(o.rescale(1), Ok(D::from_mantissa(15))); // rescale is about the value
     assert_eq!(o.rescale(0), Err(ParseError::Precision));
 }
+
+/// Checked-method tests do not protect operator forwarding: a `/=` implemented
+/// with `*` still type-checks. Exercise integer and decimal operands, assignments,
+/// and both Sum impls for both wrappers and every primitive inner type.
+#[test]
+fn operators_assign_and_sum_cover_all_inner_types() {
+    fn run<T: Int>() {
+        let v = |n: i8| T::from_big(&BigInt::from(n)).unwrap();
+        let c = |n: i8| C::<T, 1>::from_mantissa(v(n));
+        let d = |n: i8| D::<T>::from_mantissa(v(n));
+        macro_rules! integer_ops {
+            ($make:ident, $dec:ty) => {
+                let (a, b) = ($make(5), $make(2));
+                assert_eq!(a + b, $make(7));
+                assert_eq!(a - b, $make(3));
+                let mut x = a; x += b; assert_eq!(x, $make(7));
+                x = a; x -= b; assert_eq!(x, $make(3));
+                assert_eq!(a * v(2), $make(10));
+                assert_eq!(a / v(2), $make(3)); // 5/2: ties away
+                x = a; x *= v(2); assert_eq!(x, $make(10));
+                x = a; x /= v(2); assert_eq!(x, $make(3));
+                let values = [a, b];
+                assert_eq!(values.into_iter().sum::<$dec>(), $make(7));
+                assert_eq!(values.iter().sum::<$dec>(), $make(7));
+                assert!(guarded(|| { let mut x = a; x /= T::ZERO; x }).is_err());
+                assert!(guarded(|| { let mut x = <$dec>::MAX; x *= v(2); x }).is_err());
+                let on = overflow_checks();
+                let sum = guarded(|| [<$dec>::MAX, <$dec>::EPSILON].iter().sum::<$dec>());
+                if on { assert!(sum.is_err()); } else { assert_eq!(sum, Ok(<$dec>::MIN)); }
+            };
+        }
+        integer_ops!(c, C<T, 1>);
+        integer_ops!(d, D<T>);
+        // RHS has a different inner type and an explicit scale of 1 (value 0.2).
+        let rhs = C::<u128, 1>::from_mantissa(2);
+        assert_eq!(c(5) * rhs, c(1));
+        assert_eq!(c(5) / rhs, c(25));
+        let mut x = c(5); x *= rhs; assert_eq!(x, c(1));
+        x = c(5); x /= rhs; assert_eq!(x, c(25));
+        assert_eq!(d(5) * rhs, d(1));
+        assert_eq!(d(5) / rhs, d(25));
+        let mut x = d(5); x *= rhs; assert_eq!(x, d(1));
+        x = d(5); x /= rhs; assert_eq!(x, d(25));
+        let zero = C::<u128, 1>::ZERO;
+        assert!(guarded(|| { let mut x = c(5); x /= zero; x }).is_err());
+        assert!(guarded(|| { let mut x = d(5); x /= zero; x }).is_err());
+    }
+    run::<i8>(); run::<i16>(); run::<i32>(); run::<i64>(); run::<i128>();
+    run::<u8>(); run::<u16>(); run::<u32>(); run::<u64>(); run::<u128>();
+}
+
+/// Every method without `_ext` rounds with `Rounding::Round`. Each value is 0.4 or 0.6 of a unit
+/// of the result, positive and negative, so each other mode differs from `Round` for at least one
+/// of the four: `Floor`/`TowardsZero` at +0.6 and -0.4, `Ceiling`/`AwayFromZero` at +0.4 and -0.6.
+/// (A default of `Floor` in one forwarding method used to pass the whole suite.)
+#[test]
+fn default_rounding_of_every_non_ext_method_is_round() {
+    let want = [1i64, 2, -1, -2];
+    for (i, m) in [140i64, 160, -140, -160].into_iter().enumerate() {
+        let w = want[i];
+        let c = C::<i64, 2>::from_mantissa(m);
+        let one = C::<i64, 2>::from_mantissa(100);
+        assert_eq!(c.checked_rescale::<0>().unwrap().mantissa(), w, "const rescale {m}");
+        assert_eq!(c.round(0).mantissa(), w * 100, "const round {m}");
+        assert_eq!(c.checked_round(0).unwrap().mantissa(), w * 100, "const checked_round {m}");
+        assert_eq!(c.checked_round_to_multiple(one).unwrap().mantissa(), w * 100, "const tick {m}");
+        assert_eq!(c.checked_div_int(100).unwrap().mantissa(), w, "const div_int {m}");
+        assert_eq!(c.checked_mul_ratio(1i64, 100i64).unwrap().mantissa(), w, "const mul_ratio {m}");
+        assert_eq!(c.checked_mul::<i64, 2, 0>(one).unwrap().mantissa(), w, "const checked_mul {m}");
+        assert_eq!(c.checked_div::<i64, 2, 0>(one).unwrap().mantissa(), w, "const checked_div {m}");
+
+        let o = D::<i64>::from_mantissa(m);
+        let one = D::<i64>::from_mantissa(100);
+        assert_eq!(o.checked_rescale(2).unwrap().mantissa(), w, "oob rescale {m}");
+        assert_eq!(o.round_diff(2).mantissa(), w * 100, "oob round_diff {m}");
+        assert_eq!(o.checked_round_diff(2).unwrap().mantissa(), w * 100, "oob checked_round_diff {m}");
+        assert_eq!(o.checked_round_to_multiple(one).unwrap().mantissa(), w * 100, "oob tick {m}");
+        assert_eq!(o.checked_div_int(100).unwrap().mantissa(), w, "oob div_int {m}");
+        assert_eq!(o.checked_mul_ratio(1i64, 100i64).unwrap().mantissa(), w, "oob mul_ratio {m}");
+        assert_eq!(o.checked_mul(one, 4).unwrap().mantissa(), w, "oob checked_mul {m}");
+        assert_eq!(o.checked_div(one, 0).unwrap().mantissa(), w, "oob checked_div {m}");
+        assert_eq!(o.checked_mul_const_scale(C::<i64, 4>::from_mantissa(100)).unwrap().mantissa(), w, "oob mul const {m}");
+        assert_eq!(o.checked_div_const_scale(C::<i64, 0>::from_mantissa(100)).unwrap().mantissa(), w, "oob div const {m}");
+
+        // the operators round with `Round` too (here the value is 1.4 / 1.6 units of the result)
+        let (c, o) = (C::<i64, 2>::from_mantissa(m / 10), D::<i64>::from_mantissa(m / 10));
+        assert_eq!((c * C::<i64, 3>::from_mantissa(100)).mantissa(), w, "const * {m}");
+        assert_eq!((c / C::<i64, 0>::from_mantissa(10)).mantissa(), w, "const / {m}");
+        assert_eq!((c / 10i64).mantissa(), w, "const / int {m}");
+        assert_eq!((o * C::<i64, 3>::from_mantissa(100)).mantissa(), w, "oob * const {m}");
+        assert_eq!((o / C::<i64, 0>::from_mantissa(10)).mantissa(), w, "oob / const {m}");
+        assert_eq!((o / 10i64).mantissa(), w, "oob / int {m}");
+        let (mut c2, mut o2) = (c, o);
+        c2 *= C::<i64, 3>::from_mantissa(100);
+        o2 /= 10i64;
+        assert_eq!((c2.mantissa(), o2.mantissa()), (w, w), "assign ops {m}");
+    }
+}

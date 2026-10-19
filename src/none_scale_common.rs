@@ -3,12 +3,33 @@ macro_rules! define_none_scale_common {
         /// The zero value.
         pub const ZERO: Self = Self(I::ZERO);
 
-        /// The largest value, (2<sup>b</sup> - 1) / 10<sup>S</sup>, where `b`
-        /// is the bits of `I`.
+        /// The largest value: (2<sup>b-1</sup> - 1) / 10<sup>S</sup> for signed `I`,
+        /// or (2<sup>b</sup> - 1) / 10<sup>S</sup> for unsigned `I`, where `b` is
+        /// the number of bits of `I`.
+        ///
+        /// ```
+        /// use primitive_fixed_point_decimal::{ConstScaleFpdec as C, OobScaleFpdec as D};
+        /// for m in [C::<i8, 0>::MAX.mantissa(), D::<i8>::MAX.mantissa()] {
+        ///     assert_eq!(m as u16, (1_u16 << (i8::BITS - 1)) - 1);
+        /// }
+        /// for m in [C::<u8, 0>::MAX.mantissa(), D::<u8>::MAX.mantissa()] {
+        ///     assert_eq!(m as u16, (1_u16 << u8::BITS) - 1);
+        /// }
+        /// ```
         pub const MAX: Self = Self(I::MAX);
 
-        /// The smallest value, -(2<sup>b</sup> / 10<sup>S</sup>), where `b`
-        /// is the bits of `I`.
+        /// The smallest value: -2<sup>b-1</sup> / 10<sup>S</sup> for signed `I`,
+        /// or zero for unsigned `I`, where `b` is the number of bits of `I`.
+        ///
+        /// ```
+        /// use primitive_fixed_point_decimal::{ConstScaleFpdec as C, OobScaleFpdec as D};
+        /// for m in [C::<i8, 0>::MIN.mantissa(), D::<i8>::MIN.mantissa()] {
+        ///     assert_eq!(m as i16, -(1_i16 << (i8::BITS - 1)));
+        /// }
+        /// for m in [C::<u8, 0>::MIN.mantissa(), D::<u8>::MIN.mantissa()] {
+        ///     assert_eq!(m, 0);
+        /// }
+        /// ```
         pub const MIN: Self = Self(I::MIN);
 
         /// The smallest difference value, 10<sup>-S</sup> .
@@ -41,6 +62,67 @@ macro_rules! define_none_scale_common {
             self.0.checked_sub(&rhs.0).map(Self)
         }
 
+        /// Saturating addition. Computes `self + rhs`, clamping at `MIN` / `MAX` instead of overflowing.
+        ///
+        /// The right operand must have the same scale with self.
+        #[must_use]
+        pub fn saturating_add(self, rhs: Self) -> Self {
+            Self(num_traits::Saturating::saturating_add(self.0, rhs.0))
+        }
+
+        /// Saturating subtraction. Computes `self - rhs`, clamping at `MIN` / `MAX` instead of overflowing.
+        ///
+        /// The right operand must have the same scale with self.
+        #[must_use]
+        pub fn saturating_sub(self, rhs: Self) -> Self {
+            Self(num_traits::Saturating::saturating_sub(self.0, rhs.0))
+        }
+
+        /// Round to a multiple of `step`, such as a price to the tick size.
+        ///
+        /// Equivalent to [`Self::checked_round_to_multiple_ext`] with `Rounding::Round`.
+        #[must_use]
+        pub fn checked_round_to_multiple(self, step: Self) -> Option<Self> {
+            self.checked_round_to_multiple_ext(step, Rounding::Round)
+        }
+
+        /// Round to a multiple of `step`, such as a price to the tick size, with the
+        /// rounding you choose.
+        ///
+        /// `step` has the scale of `self`; its sign does not matter. Returns `None` if
+        /// `step` is zero, or the multiple does not fit (rounding `127` of an `i8` up to a
+        /// multiple of `10`).
+        ///
+        /// Examples:
+        ///
+        /// ```
+        /// // Here we use `ConstScaleFpdec` as example. It's same for `OobScaleFpdec`.
+        /// use primitive_fixed_point_decimal::{ConstScaleFpdec, Rounding, fpdec};
+        /// type Price = ConstScaleFpdec<i64, 4>;
+        ///
+        /// let tick: Price = fpdec!(0.05);
+        /// let bid: Price = fpdec!(10.1234);
+        /// assert_eq!(bid.checked_round_to_multiple_ext(tick, Rounding::Floor), Some(fpdec!(10.10)));
+        /// assert_eq!(bid.checked_round_to_multiple_ext(tick, Rounding::Ceiling), Some(fpdec!(10.15)));
+        /// assert_eq!(bid.checked_round_to_multiple(tick), Some(fpdec!(10.10)));
+        /// assert_eq!(bid.checked_round_to_multiple(Price::ZERO), None);
+        /// ```
+        #[must_use]
+        pub fn checked_round_to_multiple_ext(self, step: Self, rounding: Rounding) -> Option<Self> {
+            // Every value is a multiple of 1 and of -1, and `MIN / -1` would overflow on the way.
+            if step.0 == I::ONE || (I::MIN < I::ZERO && step.0 == I::ZERO - I::ONE) {
+                return Some(self);
+            }
+            // Dividing by a negative step negates the quotient, which swaps what `Floor` and
+            // `Ceiling` mean for the multiple. (Negating `step` instead would fail for `MIN`.)
+            let rounding = match rounding {
+                Rounding::Floor if step.0 < I::ZERO => Rounding::Ceiling,
+                Rounding::Ceiling if step.0 < I::ZERO => Rounding::Floor,
+                r => r,
+            };
+            self.0.rounding_div(step.0, rounding)?.checked_mul(&step.0).map(Self)
+        }
+
         /// Checked multiplication with integer. Computes `self * n`, returning
         /// `None` if overflow occurred.
         ///
@@ -51,7 +133,7 @@ macro_rules! define_none_scale_common {
             self.0.checked_mul(&n.into()).map(Self)
         }
 
-        /// Computes `self * a/b`, returning `None` if overflow occurred.
+        /// Computes `self * a/b`, returning `None` if `b` is zero or overflow occurred.
         ///
         /// Equivalent to [`Self::checked_mul_ratio_ext`] with `Rounding::Round`.
         #[must_use]
@@ -62,7 +144,8 @@ macro_rules! define_none_scale_common {
             self.checked_mul_ratio_ext(a, b, Rounding::Round)
         }
 
-        /// Computes `self * a/b`, returning `None` if overflow occurred.
+        /// Computes `self * a/b`, returning `None` if `b` is zero or overflow occurred
+        /// (the rounded result does not fit).
         ///
         /// The arguments `a` and `b` could be primitive integers,
         /// `ConstScaleFpdec` or `OobScaleFpdec` with same scale.
@@ -85,6 +168,10 @@ macro_rules! define_none_scale_common {
         ///
         /// // integer
         /// assert_eq!(margin.checked_mul_ratio(200, 300).unwrap(), fpdec!(20000));
+        ///
+        /// // `None` for a zero `b`, and for a result that does not fit
+        /// assert_eq!(margin.checked_mul_ratio(200, 0), None);
+        /// assert_eq!(Balance::MAX.checked_mul_ratio(2, 1), None);
         /// ```
         #[must_use]
         pub fn checked_mul_ratio_ext<R>(self, a: R, b: R, rounding: Rounding) -> Option<Self>
@@ -191,6 +278,16 @@ macro_rules! define_none_scale_common_signed {
         #[must_use]
         pub fn abs(self) -> Self {
             Self(self.0.abs())
+        }
+
+        /// Checked negation. Computes `-self`, returning `None` if `self == MIN`.
+        #[must_use]
+        pub fn checked_neg(self) -> Option<Self> {
+            if self == Self::MIN {
+                None
+            } else {
+                Some(Self(-self.0))
+            }
         }
 
         /// Checked absolute value. Computes `self.abs()`, returning `None` if `self == MIN`.

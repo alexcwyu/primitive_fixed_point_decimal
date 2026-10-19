@@ -113,6 +113,29 @@ where
             *self - *other
         }
     }
+    /// `1`, `-1` or `0` as a decimal.
+    ///
+    /// # Panics
+    ///
+    /// For a non-zero value, if `1` is not representable at this scale -- see
+    /// [`One::one`]. Compare with [`Signed::is_positive`] / [`Signed::is_negative`]
+    /// when the scale may be negative or large.
+    ///
+    /// ```
+    /// use num_traits::Signed;
+    /// use primitive_fixed_point_decimal::ConstScaleFpdec;
+    ///
+    /// assert_eq!(ConstScaleFpdec::<i32, 2>::from_mantissa(-5).signum().mantissa(), -100);
+    /// assert_eq!(ConstScaleFpdec::<i8, 4>::from_mantissa(0).signum().mantissa(), 0); // zero never panics
+    /// ```
+    ///
+    /// ```should_panic
+    /// use num_traits::Signed;
+    /// use primitive_fixed_point_decimal::ConstScaleFpdec;
+    ///
+    /// // `1` would need a mantissa of 10_000, which an `i8` cannot hold.
+    /// let _ = ConstScaleFpdec::<i8, 4>::from_mantissa(5).signum();
+    /// ```
     fn signum(&self) -> Self {
         if self.is_pos() {
             Self::one()
@@ -171,12 +194,7 @@ where
     I: FpdecInner + Signed,
 {
     fn checked_neg(&self) -> Option<Self> {
-        // `-MIN` is not representable in two's complement.
-        if *self == Self::MIN {
-            None
-        } else {
-            Some(-*self)
-        }
+        ConstScaleFpdec::checked_neg(*self)
     }
 }
 
@@ -234,9 +252,22 @@ where
     }
 }
 
-/// Conversions from primitives are **exact or nothing**: they return `None`
-/// rather than rounding, so a value that does not fit the scale is rejected
-/// instead of silently changed.
+/// Conversions from integer primitives are **exact or nothing**: they return
+/// `None` rather than rounding a value that does not fit the scale.
+/// Floating-point conversions delegate to `TryFrom` and round the scaled float
+/// to nearest, with ties away from zero; invalid or out-of-range results return
+/// `None`.
+///
+/// ```
+/// use num_traits::FromPrimitive;
+/// use primitive_fixed_point_decimal::ConstScaleFpdec as C;
+///
+/// assert_eq!(C::<i32, 0>::from_f64(1.5).map(|d| d.mantissa()), Some(2));
+/// assert_eq!(C::<i32, 0>::from_f64(-1.5).map(|d| d.mantissa()), Some(-2));
+/// assert_eq!(C::<i32, 0>::from_f64(f64::INFINITY), None);
+/// assert_eq!(C::<i32, -1>::from_i64(15), None);
+/// assert_eq!(C::<i32, -1>::from_i64(20).map(|d| d.mantissa()), Some(2));
+/// ```
 impl<I, const S: i32> FromPrimitive for ConstScaleFpdec<I, S>
 where
     I: FpdecInner + FromPrimitive,
@@ -249,7 +280,7 @@ where
         Self::try_from(n).ok()
     }
     // The provided `from_i128`/`from_u128` go through `i64`/`u64`, which would
-    // reject every value above 2^63 even for a 128-bit inner type.
+    // reject values outside those widths even for a 128-bit inner type.
     fn from_i128(n: i128) -> Option<Self> {
         Self::try_from(n).ok()
     }
