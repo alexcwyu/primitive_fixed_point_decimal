@@ -1,5 +1,9 @@
 # Unreleased
 
+- Faster 128-bit arithmetic without LTO: preserve constant scales through multiplication and rounding, and keep double-width overflow reduction outside the inlined `calc_mul_div` fast path. Arithmetic results and overflow handling are unchanged.
+
+- Tests: the arithmetic benchmark now covers `i128`/`u128` decimal multiplication, division, ratios, integer division and precision rounding, checks exact `Option` results before timing, and guards the measured performance gaps. Signed and runtime-scale rounding workloads run with optional `--lto` coverage.
+
 - Docs: clarify overflow-check-dependent `Neg` behavior and the separate `i64`/`u64` limits of default `FromPrimitive` forwarding.
 
 - Fix: converting a large `u128` decimal to `f32` no longer overflows the mantissa before applying a positive scale; finite scaled values and underflow-to-zero results are preserved.

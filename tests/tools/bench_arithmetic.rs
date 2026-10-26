@@ -5,7 +5,7 @@ use primitive_fixed_point_decimal::{
     ConstScaleFpdec as C, FpdecInner, OobScaleFpdec as D, Rounding,
 };
 use std::{hint::black_box, time::Instant};
-fn bench<T: Copy, F: FnMut(T, T) -> T>(name: &str, data: &[(T, T)], mut f: F) {
+fn bench<A: Copy, B: Copy, O, F: FnMut(A, B) -> O>(name: &str, data: &[(A, B)], mut f: F) {
     let mut acc = 0;
     for _ in 0..100 {
         for &(a, b) in data {
@@ -147,6 +147,22 @@ fn main() {
                     (a, (rng % 65535 + 1) as $t)
                 })
                 .collect();
+            // Check Options before timing: map_or(0) would hide a false overflow.
+            for &(a, b) in &data {
+                let x = C::<$t, 4>::from_mantissa(a);
+                let y = C::<$t, 4>::from_mantissa(b);
+                let narrow = |q| <$t>::try_from(q).ok();
+                assert_eq!(x.checked_mul::<_, 4, 4>(y).map(|v| v.mantissa()),
+                    simple(a as $w * b as $w, 10000).and_then(narrow));
+                assert_eq!(x.checked_div::<_, 4, 4>(y).map(|v| v.mantissa()),
+                    simple(a as $w * 10000, b as $w).and_then(narrow));
+                assert_eq!(x.checked_div_int(b).map(|v| v.mantissa()),
+                    simple(a as $w, b as $w).and_then(narrow));
+                assert_eq!(x.checked_mul_ratio(b, 65537 as $t).map(|v| v.mantissa()),
+                    simple(a as $w * b as $w, 65537).and_then(narrow));
+                assert_eq!(x.checked_round(2).map(|v| v.mantissa()),
+                    simple(a as $w, 100).and_then(|q| narrow(q * 100)));
+            }
             bench(concat!(stringify!($t), " decimal mul"), &data, |a, b| {
                 if alt {
                     simple(a as $w * b as $w, 10000)
@@ -207,7 +223,63 @@ fn main() {
     extra!(i32, i64);
     extra!(i64, i128);
     extra!(u64, u128);
+    // These bounded operands fit in 128 bits even before rescaling.
+    extra!(i128, i128);
+    extra!(u128, u128);
     i32_div_signs(alt);
+    i128_round_signs_and_runtime(alt);
+}
+
+// The generated mantissas fit i64; multiply the rounded quotient in i128 so
+// rounding an i64 limit up does not overflow the reference implementation.
+#[inline(always)]
+fn round_small(a: i64, exp: i64, mode: Rounding) -> i128 {
+    let exp = exp as u64;
+    let (q, rem) = (a.unsigned_abs() / exp, a.unsigned_abs() % exp);
+    let away = rem != 0 && match mode {
+        Rounding::Round => rem >= exp - rem,
+        Rounding::Floor => a < 0,
+        Rounding::Ceiling => a > 0,
+        Rounding::TowardsZero => false,
+        Rounding::AwayFromZero => true,
+    };
+    let rounded = (q as i128 + i128::from(away)) * exp as i128;
+    if a < 0 { -rounded } else { rounded }
+}
+
+fn i128_round_signs_and_runtime(alt: bool) {
+    let modes = [Rounding::Round, Rounding::Floor, Rounding::Ceiling,
+        Rounding::TowardsZero, Rounding::AwayFromZero];
+    for (a, want) in [(149, [100,100,200,100,200]), (150, [200,100,200,100,200]),
+        (-149, [-100,-200,-100,-100,-200]), (-150, [-200,-200,-100,-100,-200]),
+        (0, [0;5]), (200, [200;5]), (-200, [-200;5])] {
+        for (mode, want) in modes.into_iter().zip(want) {
+            assert_eq!(round_small(a, 100, mode), want);
+        }
+    }
+    let mut rng = 0x1234_5678_9abc_def0u64;
+    let data: Vec<_> = (0..1024).map(|i| {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let a = (rng as i64) >> 40;
+        let diff = [0,1,2,4,8][i % 5];
+        (a as i128, (diff, 10_i64.pow(diff as u32), modes[(i / 5) % 5]))
+    }).collect();
+    for &(a, (diff, exp, mode)) in &data {
+        assert_eq!(C::<i128,4>::from_mantissa(a).checked_round(2).map(|x| x.mantissa()),
+            Some(round_small(a as i64, 100, Rounding::Round)));
+        assert_eq!(D::from_mantissa(a).checked_round_diff_ext(diff, mode).map(|x| x.mantissa()),
+            Some(round_small(a as i64, exp, mode)));
+    }
+    bench("i128 round signs", &data, |a, _| if alt {
+        Some(round_small(a as i64, 100, Rounding::Round))
+    } else {
+        C::<i128,4>::from_mantissa(a).checked_round(2).map(|x| x.mantissa())
+    });
+    bench("i128 round runtime", &data, |a, (diff, exp, mode)| if alt {
+        Some(round_small(a as i64, exp, mode))
+    } else {
+        D::from_mantissa(a).checked_round_diff_ext(diff, mode).map(|x| x.mantissa())
+    });
 }
 
 // Sign-diverse runtime decimal division, with the same operand barriers on both paths.

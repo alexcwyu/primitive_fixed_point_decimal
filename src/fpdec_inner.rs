@@ -120,7 +120,8 @@ pub trait FpdecInner:
 
     // works only when: diff_scale in range [-Self::DIGITS, Self::DIGITS]
     // diff_scale = scale (self + rhs - result)
-    #[inline]
+    // Preserve constant scales through the mixed-type and 128-bit dispatch.
+    #[inline(always)]
     fn checked_mul_ext(self, rhs: Self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
         if diff_scale > 0 {
             // self * rhs / diff_exp
@@ -167,6 +168,7 @@ pub trait FpdecInner:
     // Returns `None` if the rounded value is not representable: `i8` 127 rounded
     // UP to hundreds is 200, and rounding any non-zero value away from zero at a
     // scale beyond `Self::DIGITS` gives `+-10^diff_scale`.
+    #[inline]
     fn checked_round_diff_with_rounding(self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
         if diff_scale <= 0 {
             return Some(self);
@@ -866,6 +868,7 @@ fn pad_zeros(n: usize, buf: &mut [MaybeUninit<u8>]) -> usize {
 /// `None`, so `0.0001 * 1000.00` (an `i16` times an `i64` of 100000) "overflowed" although the
 /// result, 0.1, fits -- the magnitudes are multiplied as `u128`, the sign applied, and the
 /// result narrowed to `I`.
+#[inline(always)]
 pub(crate) fn mul_ext_mixed<I: FpdecInner, J: FpdecInner>(a: I, b: J, diff: i32, rounding: Rounding) -> Option<I> {
     match I::from(b) {
         Some(b) => a.checked_mul_ext(b, diff, rounding),

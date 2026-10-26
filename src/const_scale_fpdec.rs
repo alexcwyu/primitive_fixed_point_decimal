@@ -317,6 +317,8 @@ where
     ///     Some(Dec::from_mantissa(100)));
     /// ```
     #[must_use]
+    // Preserve constant target scales without forcing the shared runtime-scale path inline.
+    #[inline(always)]
     pub fn checked_round_ext(self, scale: i32, rounding: Rounding) -> Option<Self> {
         // saturating: `S - scale` must not overflow for an absurd `scale`.
         self.0

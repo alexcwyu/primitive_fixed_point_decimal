@@ -94,48 +94,12 @@ impl FpdecInner for i128 {
         ALL_EXPS.get(i).copied()
     }
 
+    #[inline]
     fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
-        // happy path, no overflow
-        if let Some(r) = self.checked_mul(b) {
-            return r.rounding_div(c, rounding);
+        match self.checked_mul(b) {
+            Some(p) => p.rounding_div(c, rounding),
+            None => calc_mul_div_overflow_i128(self, b, c, rounding),
         }
-
-        // normal path
-
-        // (mhigh, mlow) = a * b
-        let (mhigh, mlow) = mul2(self.unsigned_abs(), b.unsigned_abs());
-
-        // (last_dividend, q) = (mhigh, mlow) / abs(c)
-        let unsigned_c = c.unsigned_abs();
-        let (last_dividend, mut q) = reduce2(mhigh, mlow, unsigned_c)?;
-
-        // back to signed i128: last_dividend
-        let mut last_dividend = match i128::try_from(last_dividend) {
-            Ok(dividend) => dividend,
-            Err(_) => {
-                // one more division
-                q = q.checked_add(last_dividend / unsigned_c)?;
-                (last_dividend % unsigned_c) as i128
-            }
-        };
-        if (self ^ b) < 0 {
-            last_dividend = -last_dividend;
-        }
-
-        // back to signed i128: quotient
-        let q = if (self ^ b ^ c) < 0 {
-            if q > (i128::MAX as u128 + 1) {
-                return None;
-            }
-            (q as i128).wrapping_neg()
-        } else {
-            i128::try_from(q).ok()?
-        };
-
-        // final division
-        let last_q = last_dividend.rounding_div(c, rounding)?;
-
-        q.checked_add(last_q)
     }
 
     #[inline]
@@ -267,28 +231,12 @@ impl FpdecInner for u128 {
         ALL_EXPS.get(i).copied()
     }
 
+    #[inline]
     fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
-        // happy path, no overflow
-        if let Some(r) = self.checked_mul(b) {
-            return r.rounding_div(c, rounding);
+        match self.checked_mul(b) {
+            Some(p) => p.rounding_div(c, rounding),
+            None => calc_mul_div_overflow_u128(self, b, c, rounding),
         }
-
-        // normal path
-
-        // (mhigh, mlow) = a * b
-        let (mhigh, mlow) = mul2(self, b);
-
-        // (last_dividend, q) = (mhigh, mlow) / c
-        let (last_dividend, q) = if c < (1_u128 << 127) {
-            reduce2(mhigh, mlow, c)?
-        } else {
-            reduce2_big(mhigh, mlow, c)?
-        };
-
-        // final division
-        let last_q = last_dividend.rounding_div(c, rounding)?;
-
-        q.checked_add(last_q)
     }
 
     #[inline]
@@ -326,6 +274,61 @@ impl FpdecInner for u128 {
         }
         self.do_rounding_div(b, rounding)
     }
+}
+
+// Keep double-width reduction out of the inlined single-width path.
+fn calc_mul_div_overflow_i128(a: i128, b: i128, c: i128, rounding: Rounding) -> Option<i128> {
+    // (mhigh, mlow) = a * b
+    let (mhigh, mlow) = mul2(a.unsigned_abs(), b.unsigned_abs());
+
+    // (last_dividend, q) = (mhigh, mlow) / abs(c)
+    let unsigned_c = c.unsigned_abs();
+    let (last_dividend, mut q) = reduce2(mhigh, mlow, unsigned_c)?;
+
+    // back to signed i128: last_dividend
+    let mut last_dividend = match i128::try_from(last_dividend) {
+        Ok(dividend) => dividend,
+        Err(_) => {
+            // one more division
+            q = q.checked_add(last_dividend / unsigned_c)?;
+            (last_dividend % unsigned_c) as i128
+        }
+    };
+    if (a ^ b) < 0 {
+        last_dividend = -last_dividend;
+    }
+
+    // back to signed i128: quotient
+    let q = if (a ^ b ^ c) < 0 {
+        if q > (i128::MAX as u128 + 1) {
+            return None;
+        }
+        (q as i128).wrapping_neg()
+    } else {
+        i128::try_from(q).ok()?
+    };
+
+    // final division
+    let last_q = last_dividend.rounding_div(c, rounding)?;
+
+    q.checked_add(last_q)
+}
+
+fn calc_mul_div_overflow_u128(a: u128, b: u128, c: u128, rounding: Rounding) -> Option<u128> {
+    // (mhigh, mlow) = a * b
+    let (mhigh, mlow) = mul2(a, b);
+
+    // (last_dividend, q) = (mhigh, mlow) / c
+    let (last_dividend, q) = if c < (1_u128 << 127) {
+        reduce2(mhigh, mlow, c)?
+    } else {
+        reduce2_big(mhigh, mlow, c)?
+    };
+
+    // final division
+    let last_q = last_dividend.rounding_div(c, rounding)?;
+
+    q.checked_add(last_q)
 }
 
 // calculate: a * b = (mhigh,mlow)
