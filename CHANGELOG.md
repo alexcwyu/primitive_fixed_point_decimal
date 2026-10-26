@@ -1,5 +1,13 @@
 # Unreleased
 
+- **Faster `i128`/`u128` decimal multiplication and division (12 dp in particular), semantics unchanged.** Signed `calc_mul_div` now works on magnitudes through the `u128` implementation and flips `Floor`/`Ceiling` for negative results, instead of a separate signed double-word path. `calc_mul_div_exp` picks its numerator in one place (`scaled_numerator`): a 63-bit-operand product, a checked 64x128-bit product for 12 dp where division by `10^12` is native, or the previous leading-zeros test; anything that may not fit still takes the double-word division. `TowardsZero` division returns right after the checked quotient, and the 12 dp mul/div dispatch is kept constant for runtime `OobScaleFpdec` scales. Details and measurements: `docs/i128-d96-parity.html`.
+
+- Tests: `tests/arith_adversarial.rs` compares `checked_mul_ext` / `checked_div_ext` (every scale difference in `[-DIGITS, DIGITS]`, all rounding modes, same-width and mixed-width operands, const and out-of-band scales), `calc_mul_div`, `rounding_div`, integer division, ratio multiplication, round-to-multiple, `%`, `+`, `-`, and `round_diff_ext` with a `BigInt` specification. Operands are steered at 2^63, 2^64, 2^126, 2^127, 2^128, powers of ten, quotients at and one past the type limits, and exact ties; mutants of the new fast paths, of the negative-result rounding flip, and of the `TowardsZero` shortcut fail it. Scale with `PFPD_ADV_SCALE`, vary with `PFPD_ADV_SEED`. `tests/i128_fast_path.rs` covers the opaque runtime-scale dispatch.
+
+- Tests: the `u64` `calc_mul_div_exp` rounding-extra overflow regression now uses operands that actually enter the fast path (`u32::MAX * i32::MAX` at 19 digits); the previous `3e9 * 3e9` has 64 leading zeros, one short of the guard, so it never exercised it.
+
+- Tooling: `tests/tools/run_i128_parity.py` (matched i128 mul/div comparison against fixdec D96 at 8/10/12 dp) and `tests/tools/decimal_comparison`.
+
 - Docs: clarify overflow-check-dependent `Neg` behavior and the separate `i64`/`u64` limits of default `FromPrimitive` forwarding.
 
 - Fix: converting a large `u128` decimal to `f32` no longer overflows the mantissa before applying a positive scale; finite scaled values and underflow-to-zero results are preserved.

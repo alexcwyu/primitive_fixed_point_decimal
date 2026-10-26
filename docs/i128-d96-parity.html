@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>i128 decimal arithmetic: correctness and D96 parity</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6577; --rule: #d9dee8; --soft: #f4f6fa;
+    --accent: #1f5fbf; --good: #17794a; --warn: #9a5b00; --code-bg: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151c; --fg: #e4e8f0; --muted: #98a2b5; --rule: #2a3040; --soft: #1a1f2a;
+      --accent: #7fb0ff; --good: #5fd39a; --warn: #f0b45a; --code-bg: #1d2330;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 56rem; margin: 0 auto; padding: 2rem 16px 4rem; }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.25rem; margin: 2.4rem 0 .6rem; padding-top: 1rem; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1rem; margin: 1.4rem 0 .4rem; }
+  p, li { max-width: 46rem; }
+  .meta { color: var(--muted); margin: 0 0 1.5rem; }
+  code, pre { font: 0.88em/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); border-radius: 4px; }
+  code { padding: .1em .35em; }
+  pre { padding: .8rem 1rem; overflow-x: auto; }
+  pre code { padding: 0; background: none; }
+  .callout { background: var(--soft); border-left: 4px solid var(--accent); padding: .8rem 1rem; margin: 1rem 0; border-radius: 0 6px 6px 0; }
+  .callout.warn { border-left-color: var(--warn); }
+  .table-wrap { overflow-x: auto; margin: .8rem 0 1.2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+  th, td { text-align: left; padding: .4rem .7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .good { color: var(--good); font-weight: 600; }
+  .warn-t { color: var(--warn); font-weight: 600; }
+  nav ul { padding-left: 1.1rem; margin: .3rem 0 0; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>i128 decimal arithmetic: correctness and D96 parity</h1>
+<p class="meta">26 October 2026 &middot; branch <code>perf/i128-d96-parity</code> &middot; baseline <code>3f6e82a</code> &middot; applies to <code>ConstScaleFpdec&lt;i128, S&gt;</code>, <code>OobScaleFpdec&lt;i128&gt;</code> and their <code>u128</code> counterparts</p>
+
+<nav>
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#summary">Summary</a></li>
+    <li><a href="#changes">What changed</a></li>
+    <li><a href="#correctness">Correctness evidence</a></li>
+    <li><a href="#performance">Performance</a></li>
+    <li><a href="#limits">Limits and what was not checked</a></li>
+    <li><a href="#reproduce">Reproduce</a></li>
+  </ul>
+</nav>
+
+<h2 id="summary">Summary</h2>
+<div class="callout">
+  <p><strong>Arithmetic:</strong> no incorrect result was found. An independent BigInt-oracle harness, a fresh-context code review, and the existing suites all agree with the implementation on every case tried, in debug and release builds.</p>
+  <p><strong>Speed:</strong> at 8 and 10 dp, mul and div run at 0.31&ndash;0.56&times; the fixdec D96 time. At 12 dp, mul is 0.96&ndash;0.99&times; and div about 1.01&times; D96 (worst single cell 1.069&times;), inside the 10% target. Against the pre-change baseline, 12 dp div is 35&ndash;40% faster and 12 dp mul 10&ndash;14% faster.</p>
+  <p class="warn-t">Qualification: the timings were taken on a shared, busy machine with no CPU pinning, and 57 of the 144 compared cells are flagged noisy. The target is <em>observed</em>, not <em>qualified</em>. Do not read this as proof of parity.</p>
+</div>
+
+<h2 id="changes">What changed</h2>
+<p>Results and error behaviour are unchanged: same overflow and divide-by-zero outcomes, same five rounding modes, same full <code>i128</code> range. Only the way the answer is reached changed.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Where</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>src/inner_i128.rs</code> &mdash; <code>i128::calc_mul_div</code></td><td>Works on magnitudes through the <code>u128</code> implementation. For a negative result <code>Floor</code> and <code>Ceiling</code> swap roles (<code>Floor</code> becomes <code>Ceiling</code>, <code>Ceiling</code> becomes <code>TowardsZero</code> on the magnitude); <code>-2<sup>127</sup></code> is accepted, <code>+2<sup>127</sup></code> is not. Replaces a separate signed double-word path.</td></tr>
+    <tr><td><code>scaled_numerator</code> (new, shared by <code>i128</code> and <code>u128</code> <code>calc_mul_div_exp</code>)</td><td>Chooses the numerator in one place: a product of two 63-bit magnitudes (below 2<sup>126</sup>); for 12 dp a checked 64&times;128-bit product (<code>checked_mul_u128</code>), because division by 10<sup>12</sup> is native and accepts any <code>u128</code>; otherwise the earlier leading-zeros guard. When none applies it returns <code>None</code> and the caller uses the double-word division, so large operands are never rejected early.</td></tr>
+    <tr><td><code>div_pow10</code></td><td>Division by 10<sup>12</sup> is written as a plain constant division so LLVM can strength-reduce it in non-LTO consumers. The <code>unsafe</code> reciprocal path keeps its precondition (<code>n &le; 2<sup>127</sup></code>), which every path into it satisfies.</td></tr>
+    <tr><td><code>u128::calc_mul_div</code></td><td>Exposes the <code>b == 10<sup>12</sup></code> case with its exact bound. The wide fallback moved to a <code>#[inline(never)]</code> function so it does not bloat hot loops.</td></tr>
+    <tr><td><code>src/fpdec_inner.rs</code></td><td><code>TowardsZero</code> division returns right after the checked quotient. 12 dp mul/div dispatch stays constant for runtime <code>OobScaleFpdec</code> scales. Mixed-width dispatch is inlined so constant scales and rounding reach the division. A comment on the division scale was corrected.</td></tr>
+    <tr><td><code>src/oob_scale_fpdec.rs</code></td><td><code>checked_mul_ext</code> / <code>checked_div_ext</code> marked <code>#[inline(always)]</code> (a code-size cost at each call site, not a behaviour change).</td></tr>
+  </tbody>
+</table>
+</div>
+<p>No new <code>unsafe</code> code. A stale <code>SAFETY</code> comment on <code>div_pow10</code> was corrected: <code>i != 0</code> is guaranteed by the early return for <code>i == 0</code> in <code>calc_mul_div_exp</code>.</p>
+
+<h2 id="correctness">Correctness evidence</h2>
+
+<h3>Independent differential harness</h3>
+<p><code>tests/arith_adversarial.rs</code> checks the public API against a <code>BigInt</code> specification written from the definition of each rounding mode, with no code shared with the library. Operands are steered at the thresholds where an implementation switches path: 2<sup>63</sup>, 2<sup>64</sup>, 2<sup>126</sup>, 2<sup>127</sup>, 2<sup>128</sup>, powers of ten, results exactly at and one past the type limits, and exact half-way ties.</p>
+<ul>
+  <li><code>checked_mul_ext</code> / <code>checked_div_ext</code>: every scale difference in [&minus;DIGITS, DIGITS] for the sampled cases, all five rounding modes, <code>i16</code> to <code>i128</code> and <code>u16</code> to <code>u128</code>, same-width and mixed-width operands (the magnitude path), and <code>ConstScaleFpdec</code> at 8, 10, 12 and 18 dp.</li>
+  <li><code>calc_mul_div</code>, <code>rounding_div</code>, integer division, ratio multiplication, round-to-multiple, <code>%</code>, add, sub, <code>round_diff_ext</code>, <code>checked_neg</code>, <code>checked_abs</code>.</li>
+  <li>Result: zero mismatches across 8 seeds in release at 40&times; scale (and 1&times; and 10&times; runs), plus debug runs (which also catch arithmetic-overflow panics inside the fast paths).</li>
+</ul>
+<p>The harness was shown to be able to fail. Each of these planted bugs made it fail: dropping the carry in <code>checked_mul_u128</code>; removing the <code>Floor</code>/<code>Ceiling</code> swap for negative results; widening the 63-bit guard to 64 bits; changing the <code>-2<sup>127</sup></code> limit check by one; removing the sign swap in round-to-multiple; making the <code>TowardsZero</code> shortcut round up.</p>
+
+<h3>Fresh-context review</h3>
+<p>A separate reviewer was given only the diff and the correctness contract, not the author's conclusions. It ran its own oracle (about 57 million <code>calc_mul_div</code> cases, the mul/div paths for both 128-bit types over all 77 scale differences, 29 mixed-type pairs, out-of-range scales) with overflow checks enabled, and checked by hand that every call into <code>unchecked_div_single_r1b</code> has its numerator bound. It found no defect; its one finding was the stale <code>SAFETY</code> comment, now fixed.</p>
+
+<h3>Existing and new suites</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Gate</th><th class="n">Result</th></tr></thead>
+  <tbody>
+    <tr><td><code>cargo test --features full</code> (debug)</td><td class="n good">343 passed</td></tr>
+    <tr><td><code>cargo test --features full --release</code></td><td class="n good">343 passed</td></tr>
+    <tr><td>oracle suite at <code>PFPD_ORACLE_SCALE=10</code>, release</td><td class="n good">23 passed</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The earlier recorded count was 315; the difference is the 28 tests in <code>tests/arith_adversarial.rs</code>. The feature set is <code>full</code>, which excludes the optional <code>pyo3</code> feature.</p>
+
+<h3>A weak regression test, corrected</h3>
+<p>The <code>u64</code> test for the rounding-extra overflow used <code>3e9 &times; 3e9</code>. Each operand has 32 leading zeros, one short of the 65 the fast-path guard needs, so it never entered the path it claimed to cover. It now uses <code>u32::MAX &times; i32::MAX</code> at 19 digits, which does.</p>
+
+<h2 id="performance">Performance</h2>
+
+<h3>Method</h3>
+<p>Matched, same-rounding (<code>TowardsZero</code>) comparison of the current tree, the baseline <code>3f6e82a</code>, and fixdec D96 (<code>a853c0c</code>), at 8, 10 and 12 dp, for add, sub, mul and div. Six workloads (small values, USD amounts, rates; each positive-only and mixed-sign), 1,024 shared exact 6 dp input pairs per cell, 7 rounds, at least 10 ms per cell, medians, ratios paired within each round. Every result is validated exactly against <code>Decimal</code> before timing. Release profile, no LTO, <code>codegen-units = 1</code>, macOS ARM64.</p>
+<div class="callout warn">
+  <p><strong>Noise.</strong> CPU placement and frequency were not controlled. The host was running about two dozen other CPU-using processes (build servers, editors, other agents), load average 6&ndash;7. A cell is flagged noisy when its full-range spread exceeds 20% or MAD/median exceeds 5%; no sample was discarded. 57 of the 144 compared cells are flagged. The runner therefore marks the run <code>diagnostic-unpinned-shared-host</code> and <code>parity_passed: false</code> by design.</p>
+</div>
+
+<h3>Current vs fixdec D96 and vs baseline</h3>
+<p>Each row aggregates the six workloads. Lower is faster; 1.00 is equal. &ldquo;Worst&rdquo; is the slowest single workload.</p>
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>Variant</th><th>Op</th><th class="n">dp</th><th class="n">vs D96 median</th><th class="n">vs D96 worst</th><th class="n">vs baseline median</th><th class="n">vs baseline worst</th><th class="n">noisy / 6</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Const</td><td>mul</td><td class="n">8</td><td class="n">0.355</td><td class="n">0.438</td><td class="n">0.928</td><td class="n">0.935</td><td class="n">4</td></tr>
+    <tr><td>Const</td><td>mul</td><td class="n">10</td><td class="n">0.338</td><td class="n">0.368</td><td class="n">0.930</td><td class="n">0.945</td><td class="n">6</td></tr>
+    <tr><td>Const</td><td>mul</td><td class="n">12</td><td class="n">0.957</td><td class="n">0.985</td><td class="n">0.859</td><td class="n">0.905</td><td class="n">5</td></tr>
+    <tr><td>Const</td><td>div</td><td class="n">8</td><td class="n">0.311</td><td class="n">0.370</td><td class="n">0.503</td><td class="n">0.533</td><td class="n">4</td></tr>
+    <tr><td>Const</td><td>div</td><td class="n">10</td><td class="n">0.445</td><td class="n">0.512</td><td class="n">0.611</td><td class="n">0.639</td><td class="n">6</td></tr>
+    <tr><td>Const</td><td>div</td><td class="n">12</td><td class="n">1.013</td><td class="n warn-t">1.069</td><td class="n">0.646</td><td class="n">0.687</td><td class="n">6</td></tr>
+    <tr><td>OOB</td><td>mul</td><td class="n">8</td><td class="n">0.363</td><td class="n">0.447</td><td class="n">0.927</td><td class="n">0.939</td><td class="n">4</td></tr>
+    <tr><td>OOB</td><td>mul</td><td class="n">10</td><td class="n">0.338</td><td class="n">0.377</td><td class="n">0.925</td><td class="n">0.946</td><td class="n">6</td></tr>
+    <tr><td>OOB</td><td>mul</td><td class="n">12</td><td class="n">0.986</td><td class="n">1.020</td><td class="n">0.895</td><td class="n">0.913</td><td class="n">5</td></tr>
+    <tr><td>OOB</td><td>div</td><td class="n">8</td><td class="n">0.427</td><td class="n">0.497</td><td class="n">0.673</td><td class="n">0.856</td><td class="n">2</td></tr>
+    <tr><td>OOB</td><td>div</td><td class="n">10</td><td class="n">0.480</td><td class="n">0.560</td><td class="n">0.680</td><td class="n">0.705</td><td class="n">5</td></tr>
+    <tr><td>OOB</td><td>div</td><td class="n">12</td><td class="n">1.014</td><td class="n warn-t">1.063</td><td class="n">0.602</td><td class="n">0.654</td><td class="n">4</td></tr>
+    <tr><td>Const / OOB</td><td>add, sub</td><td class="n">8, 10, 12</td><td class="n">0.81&ndash;0.82</td><td class="n">0.83</td><td class="n">1.00</td><td class="n">1.017</td><td class="n">0&ndash;5</td></tr>
+  </tbody>
+</table>
+</div>
+<ul>
+  <li><strong>Target:</strong> the slowest cell is 1.0685&times; D96, below the 1.10 limit; every one of the 72 primary cells is within it. The previous campaign (candidate R, 25 October) reported the same worst ratio, 1.0685.</li>
+  <li><strong>No regression:</strong> add and sub are unchanged within noise (worst 1.017&times; baseline, on a noisy cell). Mul and div are faster than baseline in every cell.</li>
+  <li><strong>12 dp is the tight spot.</strong> D96 is built for 12 dp natively; matching it there is the hard part, and the median is within a few percent either side of 1.0.</li>
+</ul>
+
+<h3>Evidence identities</h3>
+<div class="table-wrap">
+<table>
+  <tbody>
+    <tr><th>Benchmark binary SHA-256</th><td><code>62dca4f49a7ba03398653a3ebd2a36d84eda450a7a2f0fe1ab914a7d8478c91c</code></td></tr>
+    <tr><th>Fixture SHA-256</th><td><code>9278f0fea8f2355c44a88dfd404b207eef7d860fafd9d71dbb51d272cd028edd</code></td></tr>
+    <tr><th>Baseline</th><td><code>3f6e82a568dee9f3dde619bc6ac02b7f4448ab58</code></td></tr>
+    <tr><th>fixdec (D96)</th><td><code>a853c0c42c003588826f69586aa29e36aa72f8c9</code></td></tr>
+    <tr><th>Volume</th><td>432 cells &times; 7 rounds, 144 current-vs-D96/baseline comparisons</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The raw samples, per-round logs, host snapshots and the full generated report are kept with the run directory under <code>artifacts/</code> (not committed: it is large, machine-specific output).</p>
+
+<h2 id="limits">Limits and what was not checked</h2>
+<ul>
+  <li><strong>Scale differences outside [&minus;DIGITS, DIGITS] return <code>None</code></strong> even when a representable result exists (for example <code>1 &times; 1</code> at a difference of 39 would round to 0 or 1). This is the documented contract of <code>checked_mul_ext</code> / <code>checked_div_ext</code>, unchanged here.</li>
+  <li><strong>Sampling, not proof.</strong> The harness and the reviewer's oracle cover millions of boundary-steered cases, not all 2<sup>256</sup> operand pairs. The bound arguments for each fast path are written next to the code and were re-derived by the reviewer.</li>
+  <li><strong>Platforms and builds.</strong> Tested on one macOS ARM64 host, debug and release without LTO. Not tested: 32-bit targets, LTO or other codegen settings, the <code>pyo3</code> feature, the <code>fuzz/</code> targets, Miri.</li>
+  <li><strong>Performance qualification.</strong> A quiet, pinned machine is needed to turn &ldquo;target observed&rdquo; into &ldquo;parity qualified&rdquo;. The numbers above are diagnostics.</li>
+  <li><strong>Code size.</strong> <code>#[inline(always)]</code> on the public out-of-band <code>checked_mul_ext</code> / <code>checked_div_ext</code> copies their bodies into every call site.</li>
+</ul>
+
+<h2 id="reproduce">Reproduce</h2>
+<pre><code># correctness
+cargo test --features full --no-fail-fast
+cargo test --features full --no-fail-fast --release
+PFPD_ORACLE_SCALE=10 cargo test --features full --release --test oracle
+PFPD_ADV_SCALE=40 PFPD_ADV_SEED=1 cargo test --features full --release --test arith_adversarial
+
+# performance (writes a fresh directory under artifacts/)
+python3 tests/tools/run_i128_parity.py --self-test
+python3 tests/tools/run_i128_parity.py --runs 7 --target-ms 10</code></pre>
+<p>Run the benchmark on an otherwise idle machine and unset <code>RUSTFLAGS</code> and <code>CARGO_PROFILE_RELEASE_*</code>; the runner refuses to start if they are set.</p>
+
+</main>
+</body>
+</html>

@@ -120,8 +120,12 @@ pub trait FpdecInner:
 
     // works only when: diff_scale in range [-Self::DIGITS, Self::DIGITS]
     // diff_scale = scale (self + rhs - result)
-    #[inline]
+    #[inline(always)]
     fn checked_mul_ext(self, rhs: Self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
+        // Keep the common 128-bit 12dp exponent constant for runtime OOB scales.
+        if Self::DIGITS == 38 && diff_scale == 12 {
+            return self.calc_mul_div_exp(rhs, 12, rounding);
+        }
         if diff_scale > 0 {
             // self * rhs / diff_exp
 
@@ -141,10 +145,14 @@ pub trait FpdecInner:
     }
 
     // works only when: diff_scale in range [-Self::DIGITS, Self::DIGITS]
-    // diff_scale = scale (self + rhs - result)
+    // diff_scale = scale (self - rhs - result)
     // Keep constant scales/rounding visible through the mixed-type dispatcher.
     #[inline(always)]
     fn checked_div_ext(self, rhs: Self, diff_scale: i32, rounding: Rounding) -> Option<Self> {
+        // Keep the common 128-bit 12dp factor constant for runtime OOB scales.
+        if Self::DIGITS == 38 && diff_scale == -12 {
+            return self.calc_mul_div(Self::get_exp(12)?, rhs, rounding);
+        }
         if diff_scale > 0 {
             // self / rhs / diff_exp
             self.calc_div_div_exp(rhs, diff_scale as usize, rounding)
@@ -265,6 +273,9 @@ pub trait FpdecInner:
 
     fn do_rounding_div(self, b: Self, rounding: Rounding) -> Option<Self> {
         let q = self.checked_div(&b)?;
+        if rounding == Rounding::TowardsZero {
+            return Some(q);
+        }
         let remain = self % b;
         if remain == Self::ZERO {
             return Some(q);
@@ -866,6 +877,7 @@ fn pad_zeros(n: usize, buf: &mut [MaybeUninit<u8>]) -> usize {
 /// `None`, so `0.0001 * 1000.00` (an `i16` times an `i64` of 100000) "overflowed" although the
 /// result, 0.1, fits -- the magnitudes are multiplied as `u128`, the sign applied, and the
 /// result narrowed to `I`.
+#[inline(always)]
 pub(crate) fn mul_ext_mixed<I: FpdecInner, J: FpdecInner>(a: I, b: J, diff: i32, rounding: Rounding) -> Option<I> {
     match I::from(b) {
         Some(b) => a.checked_mul_ext(b, diff, rounding),

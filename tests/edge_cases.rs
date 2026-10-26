@@ -589,16 +589,18 @@ fn display_limits_are_exactly_200() {
 //    that broke the code before the fix.
 // ---------------------------------------------------------------------------
 
-/// u64 `calc_mul_div_exp`: the fast path was taken when `a*b < 2^64`, but it then
+/// u64 `calc_mul_div_exp`: the fast path admits `a*b < 2^63`, but it then
 /// added the rounding extra `10^i - 1` in u64, which can overflow: debug panic /
 /// release wrap to a tiny number.
 #[test]
 fn regress_u64_mul_diff19_fast_path_overflowed_adding_the_rounding_extra() {
-    let a = D::<u64>::from_mantissa(3_000_000_000); // a*a = 9e18; + (10^19 - 1) > u64::MAX
-    let m = |r| a.checked_mul_ext(a, 19, r).map(|v| v.mantissa());
+    // 32 + 33 leading zeros enters the fast path; equal 3e9 operands do not.
+    let a = D::<u64>::from_mantissa(u32::MAX as u64);
+    let b = D::<u64>::from_mantissa(i32::MAX as u64);
+    let m = |r| a.checked_mul_ext(b, 19, r).map(|v| v.mantissa());
     assert_eq!(m(Rounding::Ceiling), Some(1));
     assert_eq!(m(Rounding::AwayFromZero), Some(1));
-    assert_eq!(m(Rounding::Round), Some(1)); // 0.9 -> 1
+    assert_eq!(m(Rounding::Round), Some(1)); // ~0.922 -> 1
     assert_eq!(m(Rounding::Floor), Some(0));
     assert_eq!(m(Rounding::TowardsZero), Some(0));
 }

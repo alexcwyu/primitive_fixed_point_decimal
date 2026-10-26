@@ -3,10 +3,29 @@ use div_pow10::bit128;
 use crate::fpdec_inner::FpdecInner;
 use crate::Rounding;
 
+const SCALE_12: u128 = 10_u128.pow(12);
+
+#[inline(always)]
+fn checked_mul_u128(a: u128, b: u128) -> Option<u128> {
+    // A fitting product must have at least one 64-bit operand.
+    let (wide, word) = if let Ok(word) = u64::try_from(b) {
+        (a, word)
+    } else if let Ok(word) = u64::try_from(a) {
+        (b, word)
+    } else {
+        return None;
+    };
+    let low = u128::from(wide as u64) * u128::from(word);
+    // This sum is at most 2^128 - 2^64 - 1, so it cannot wrap.
+    let high = (wide >> 64) * u128::from(word) + (low >> 64);
+    let high = u64::try_from(high).ok()?;
+    Some((u128::from(high) << 64) | u128::from(low as u64))
+}
+
 /// `n / 10^i` for `1 <= i <= 38`, for ANY `n: u128`.
 ///
 /// `unchecked_div_single_r1b` is the faster form but requires `n <= 2^127`; the
-/// callers below add a rounding `extra` of up to `10^i - 1` to a product that is only
+/// reciprocal-path callers add a rounding `extra` of up to `10^i - 1` to a product only
 /// known to be below `2^126`. For `i <= 37` that sum is below `2^126 + 10^37 < 2^127`
 /// whatever the operands, so the fast form is always valid -- and testing `i` (a
 /// compile-time constant for `ConstScaleFpdec`) costs nothing, where testing `n` itself
@@ -14,14 +33,39 @@ use crate::Rounding;
 /// about `2^126.2`), and only there is the value checked.
 #[inline(always)]
 fn div_pow10(n: u128, i: usize) -> u128 {
+    // Keep this common divisor visible to LLVM in non-LTO consumers.
+    if i == 12 {
+        return n / SCALE_12;
+    }
     // SAFETY: callers guarantee 1 <= i <= 38 (checked by `get_exp(i)`, and `i != 0`
-    // by `checked_mul_ext`'s `diff_scale > 0` branch).
+    // by `calc_mul_div_exp`'s early return for `i == 0`).
     unsafe {
         if i < 38 || n <= 1_u128 << 127 {
             bit128::unchecked_div_single_r1b(n, i as u32)
         } else {
             bit128::unchecked_div_single(n, i as u32)
         }
+    }
+}
+
+/// `a * b + extra` as the numerator for `div_pow10(_, i)`, or `None` when it may not fit `u128`
+/// and the caller must use the double-word division instead.
+///
+/// `extra` is the rounding addend, below `10^i`.
+#[inline(always)]
+fn scaled_numerator(a: u128, b: u128, extra: u128, i: usize) -> Option<u128> {
+    if (a | b) <= i64::MAX as u128 {
+        // Both magnitudes fit 63 bits, so their product is below 2^126.
+        Some(u128::from(a as u64) * u128::from(b as u64) + extra)
+    } else if i == 12 {
+        // Native division by 10^12 accepts any u128 numerator, so only overflow matters.
+        checked_mul_u128(a, b).and_then(|product| product.checked_add(extra))
+    } else if a.leading_zeros() + b.leading_zeros() >= 128 + 2 {
+        // The product is below 2^126, so adding `extra < 10^38` cannot wrap. The sum may
+        // exceed 2^127, which `div_pow10` handles.
+        Some(a * b + extra)
+    } else {
+        None
     }
 }
 
@@ -94,48 +138,25 @@ impl FpdecInner for i128 {
         ALL_EXPS.get(i).copied()
     }
 
+    #[inline(always)]
     fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
-        // happy path, no overflow
-        if let Some(r) = self.checked_mul(b) {
-            return r.rounding_div(c, rounding);
-        }
-
-        // normal path
-
-        // (mhigh, mlow) = a * b
-        let (mhigh, mlow) = mul2(self.unsigned_abs(), b.unsigned_abs());
-
-        // (last_dividend, q) = (mhigh, mlow) / abs(c)
-        let unsigned_c = c.unsigned_abs();
-        let (last_dividend, mut q) = reduce2(mhigh, mlow, unsigned_c)?;
-
-        // back to signed i128: last_dividend
-        let mut last_dividend = match i128::try_from(last_dividend) {
-            Ok(dividend) => dividend,
-            Err(_) => {
-                // one more division
-                q = q.checked_add(last_dividend / unsigned_c)?;
-                (last_dividend % unsigned_c) as i128
-            }
+        let negative = (self ^ b ^ c) < 0;
+        let rounding = match (negative, rounding) {
+            (true, Rounding::Floor) => Rounding::Ceiling,
+            (true, Rounding::Ceiling) => Rounding::TowardsZero,
+            (_, rounding) => rounding,
         };
-        if (self ^ b) < 0 {
-            last_dividend = -last_dividend;
-        }
-
-        // back to signed i128: quotient
-        let q = if (self ^ b ^ c) < 0 {
-            if q > (i128::MAX as u128 + 1) {
+        let q = self
+            .unsigned_abs()
+            .calc_mul_div(b.unsigned_abs(), c.unsigned_abs(), rounding)?;
+        if negative {
+            if q > (1_u128 << 127) {
                 return None;
             }
-            (q as i128).wrapping_neg()
+            Some((q as i128).wrapping_neg())
         } else {
-            i128::try_from(q).ok()?
-        };
-
-        // final division
-        let last_q = last_dividend.rounding_div(c, rounding)?;
-
-        q.checked_add(last_q)
+            i128::try_from(q).ok()
+        }
     }
 
     #[inline]
@@ -159,13 +180,8 @@ impl FpdecInner for i128 {
             Rounding::Ceiling => if is_pos { exp - 1 } else { 0 },
         } as u128;
 
-        let uq = if ua.leading_zeros() + ub.leading_zeros() >= 128 + 2 {
-            // happy path, (self * b + extra) is not overflow 128-bit
-            let divident = ua * ub + extra;
-
-            // `divident < 2^126 + 10^38 < 2^128`: no wrap. It may exceed 2^127, which
-            // `div_pow10` handles.
-            div_pow10(divident, i)
+        let uq = if let Some(numerator) = scaled_numerator(ua, ub, extra, i) {
+            div_pow10(numerator, i)
         } else {
             // use double-128-bit
             let (q, _) = bit128::mul_div(ua, ub, extra, i as u32)?;
@@ -267,28 +283,18 @@ impl FpdecInner for u128 {
         ALL_EXPS.get(i).copied()
     }
 
+    #[inline(always)]
     fn calc_mul_div(self, b: Self, c: Self, rounding: Rounding) -> Option<Self> {
+        // Expose the common 12dp factor and its exact product bound to LLVM.
+        if b == SCALE_12 && self <= u128::MAX / SCALE_12 {
+            return (self * SCALE_12).rounding_div(c, rounding);
+        }
         // happy path, no overflow
         if let Some(r) = self.checked_mul(b) {
             return r.rounding_div(c, rounding);
         }
 
-        // normal path
-
-        // (mhigh, mlow) = a * b
-        let (mhigh, mlow) = mul2(self, b);
-
-        // (last_dividend, q) = (mhigh, mlow) / c
-        let (last_dividend, q) = if c < (1_u128 << 127) {
-            reduce2(mhigh, mlow, c)?
-        } else {
-            reduce2_big(mhigh, mlow, c)?
-        };
-
-        // final division
-        let last_q = last_dividend.rounding_div(c, rounding)?;
-
-        q.checked_add(last_q)
+        calc_mul_div_wide(self, b, c, rounding)
     }
 
     #[inline]
@@ -304,15 +310,10 @@ impl FpdecInner for u128 {
             Rounding::Round => exp / 2, // exp is even
         };
 
-        if self.leading_zeros() + b.leading_zeros() >= 128 + 2 {
-            // happy path, (self * b + extra) is not overflow
-            let divident = self * b + extra;
-
-            // `divident < 2^126 + 10^38 < 2^128`: no wrap. It may exceed 2^127, which
-            // `div_pow10` handles.
-            Some(div_pow10(divident, i))
+        if let Some(numerator) = scaled_numerator(self, b, extra, i) {
+            Some(div_pow10(numerator, i))
         } else {
-            bit128::mul_div(self, b, extra as u128, i as u32).map(|(q, _r)| q)
+            bit128::mul_div(self, b, extra, i as u32).map(|(q, _r)| q)
         }
     }
 
@@ -326,6 +327,19 @@ impl FpdecInner for u128 {
         }
         self.do_rounding_div(b, rounding)
     }
+}
+
+// Keep the wide fallback out of consumers' common division loops.
+#[inline(never)]
+fn calc_mul_div_wide(a: u128, b: u128, c: u128, rounding: Rounding) -> Option<u128> {
+    let (mhigh, mlow) = mul2(a, b);
+    let (last_dividend, q) = if c < (1_u128 << 127) {
+        reduce2(mhigh, mlow, c)?
+    } else {
+        reduce2_big(mhigh, mlow, c)?
+    };
+    let last_q = last_dividend.rounding_div(c, rounding)?;
+    q.checked_add(last_q)
 }
 
 // calculate: a * b = (mhigh,mlow)
@@ -429,4 +443,41 @@ fn reduce2_big(mhigh: u128, mlow: u128, divisor: u128) -> Option<(u128, u128)> {
     }
 
     Some((dividend, q))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checked_word_product_matches_integer_overflow_contract() {
+        let values = [
+            0,
+            1,
+            2,
+            3,
+            (1_u128 << 32) - 1,
+            1 << 32,
+            (1 << 63) - 1,
+            1 << 63,
+            u64::MAX as u128 - 1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            u64::MAX as u128 + 2,
+            u64::MAX as u128 + 3,
+            (1 << 127) - 1,
+            1 << 127,
+            u128::MAX,
+        ];
+        for a in values {
+            for b in values {
+                assert_eq!(super::checked_mul_u128(a, b), a.checked_mul(b), "{a} * {b}");
+            }
+        }
+        for b in [2, 3, 5, 1 << 32, (1 << 63) + 1, u64::MAX as u128] {
+            let limit = u128::MAX / b;
+            for a in [limit - 1, limit, limit + 1] {
+                assert_eq!(super::checked_mul_u128(a, b), a.checked_mul(b), "{a} * {b}");
+                assert_eq!(super::checked_mul_u128(b, a), b.checked_mul(a), "{b} * {a}");
+            }
+        }
+    }
 }

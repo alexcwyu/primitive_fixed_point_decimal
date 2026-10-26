@@ -113,6 +113,7 @@ where
     /// assert_eq!(fee, fpdec!(0.13, 2));
     /// ```
     #[must_use]
+    #[inline(always)]
     pub fn checked_mul_ext<J>(
         self,
         rhs: OobScaleFpdec<J>,
@@ -222,6 +223,7 @@ where
     /// assert_eq!(balance, fpdec!(4.34, 2));
     /// ```
     #[must_use]
+    #[inline(always)]
     pub fn checked_div_ext<J>(
         self,
         rhs: OobScaleFpdec<J>,

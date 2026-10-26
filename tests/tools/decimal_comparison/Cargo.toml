@@ -1,0 +1,27 @@
+[package]
+name = "decimal-comparison"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+current = { package = "primitive_fixed_point_decimal", path = "../../.." }
+baseline = { package = "primitive_fixed_point_decimal", git = "https://github.com/alexcwyu/primitive_fixed_point_decimal", rev = "3f6e82a568dee9f3dde619bc6ac02b7f4448ab58" }
+upstream = { package = "primitive_fixed_point_decimal", git = "https://github.com/WuBingzheng/primitive_fixed_point_decimal", rev = "493dc9e309345e0b2289a38727d9577e28a1b388" }
+fixdec = { git = "https://github.com/alexcwyu/fixdec", rev = "a853c0c42c003588826f69586aa29e36aa72f8c9", default-features = false }
+rust_decimal = { version = "=1.43.0", default-features = false, features = ["std"] }
+fastnum = "=0.7.5"
+bigdecimal = "=0.4.11"
+fixed = "=1.31.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = false
+codegen-units = 1
+
+[profile.thin]
+inherits = "release"
+lto = "thin"
